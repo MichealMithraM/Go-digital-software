@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../../../services/hrms_tracking_api.dart';
 
@@ -162,13 +163,31 @@ class _HomeLocationsDialogState extends State<HomeLocationsDialog> {
     if (id == null || lat == null || lng == null) return;
     setState(() => _reviewingId = id);
     try {
+      if (approve && home['capture_source'] == 'map_pin') {
+        final confirmed = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
+          title: const Text('Verify Home Location'),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('The employee selected this pin manually. Check the map and confirm the Home address before approving.'),
+            const SizedBox(height: 12),
+            Text('${home['address'] ?? ''}'),
+            SelectableText('$lat, $lng'),
+            TextButton.icon(onPressed: () => _viewHome(home), icon: const Icon(Icons.map_outlined), label: const Text('View Selected Location')),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('I Verified This Location')),
+          ],
+        ));
+        if (!mounted || confirmed != true) return;
+      }
       String? reason;
       if (!approve) {
         reason = await showDialog<String>(context: context, builder: (_) => const _HomeRejectionDialog());
         if (!mounted || reason == null) return;
       }
       await HrmsTrackingApi.reviewHomeLocation(
-        employeeUserId: id, approve: approve, latitude: lat, longitude: lng, rejectionReason: reason);
+        employeeUserId: id, approve: approve, latitude: lat, longitude: lng, rejectionReason: reason,
+        mapPinVerified: approve && home['capture_source'] == 'map_pin', reviewedAddress: home['address']?.toString());
       if (!mounted) return;
       await _loadHomes();
     } catch (e) {
@@ -179,6 +198,18 @@ class _HomeLocationsDialogState extends State<HomeLocationsDialog> {
   }
 
   void _showSnack(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  Future<void> _viewHome(Map<String, dynamic> home) async {
+    final lat = double.tryParse('${home['latitude']}');
+    final lng = double.tryParse('${home['longitude']}');
+    if (lat == null || lng == null || !lat.isFinite || !lng.isFinite || lat.abs() > 90 || lng.abs() > 180) return;
+    try {
+      final opened = await launchUrl(Uri.https('www.google.com', '/maps/search/', {'api': '1', 'query': '$lat,$lng'}), mode: LaunchMode.externalApplication);
+      if (!opened && mounted) _showSnack('Could not open the map. Please retry.');
+    } catch (_) {
+      if (mounted) _showSnack('Could not open the map. Please retry.');
+    }
+  }
 
   // ── filtered list ─────────────────────────────────────────────────────────
 
@@ -461,6 +492,11 @@ class _HomeLocationsDialogState extends State<HomeLocationsDialog> {
           const SizedBox(height: 8),
           Text(address, style: const TextStyle(color: _muted, fontSize: 12)),
         ],
+        if (h['capture_source'] == 'map_pin') ...[
+          const SizedBox(height: 8),
+          const Text('Map-selected Home — verify the pin and address before approval.', style: TextStyle(color: Color(0xFFB45309), fontSize: 12)),
+        ],
+        TextButton.icon(onPressed: () => _viewHome(h), icon: const Icon(Icons.map_outlined, size: 18), label: const Text('View Location')),
         if (h['rejection_reason'] != null) ...[
           const SizedBox(height: 4),
           Text('Reason: ${h['rejection_reason']}',
@@ -503,7 +539,7 @@ class _HomeLocationsDialogState extends State<HomeLocationsDialog> {
     icon: Icons.group_add_rounded,
     iconColor: _iconColor, iconBg: _iconBg,
     title: 'Employee Home Registrations',
-    desc: 'Approve Home work only after checking the registered location. Approval also changes the employee\'s work mode to Home.',
+    desc: 'Verify the Home pin and address before approval. Employee work mode and WFH permission remain managed separately.',
     child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       _tabs(),
       const SizedBox(height: 8),

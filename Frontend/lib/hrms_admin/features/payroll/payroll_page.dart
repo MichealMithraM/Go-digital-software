@@ -781,7 +781,7 @@ class _MobilePayrollList extends StatelessWidget {
                   Text(
                       e.value.status == 'Paid'
                           ? 'Salary ${e.value.salary}  →  Net ${e.value.netPay}'
-                          : 'Salary ${e.value.salary}  →  Updated ${e.value.earnedToDate}',
+                          : 'Salary ${e.value.salary}  →  Updated ${e.value.netPay} · Earned to Date ${e.value.earnedToDate}',
                       style: const TextStyle(
                           color: _PayrollColors.navy,
                           fontWeight: FontWeight.w600)),
@@ -988,7 +988,7 @@ class _PayrollTableRow extends StatelessWidget {
                 width: 140, child: Text(row.deductions, style: _cellStyle)),
             _Cell(
                 width: 140,
-                child: Text(row.earnedToDate,
+                child: Text(row.netPay,
                     style: const TextStyle(
                         color: _PayrollColors.navy,
                         fontWeight: FontWeight.w700,

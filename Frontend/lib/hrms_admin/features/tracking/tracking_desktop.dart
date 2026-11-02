@@ -874,7 +874,7 @@ class _DesktopFixedLocationDetailState
                 highlightedEmployee: widget.mode == 'Home'
                     ? widget.employee
                     : null,
-                showEmptyOverlay: false,
+                showEmptyOverlay: widget.mode == 'Home',
               ),
             ),
           ),
@@ -1018,8 +1018,8 @@ class _DailyRecordRow extends StatelessWidget {
                         fontWeight: FontWeight.w700,
                       ),
                     ),
-                    const Text(
-                      'At registered home',
+                    Text(
+                      day.status ?? 'Attendance recorded',
                       style: TextStyle(color: _desktopMuted, fontSize: 10),
                     ),
                   ],
@@ -1728,6 +1728,10 @@ Widget _statusChip(_TrackedEmployee employee, String mode) {
     label = 'Checked out';
     color = const Color(0xFF596176);
     background = const Color(0xFFF0F2F6);
+  } else if (employee.checkInAt != null && employee.onBreak) {
+    label = 'On break';
+    color = const Color(0xFFB86A00);
+    background = const Color(0xFFFFF2DE);
   } else if (employee.checkInAt != null) {
     label = 'Checked in';
     color = const Color(0xFF087A34);

@@ -64,8 +64,6 @@ class _SalaryView extends StatelessWidget {
         const SizedBox(height: 16),
         const _SalaryOverviewCard(),
         const SizedBox(height: 16),
-        const _SalaryBreakdownCard(),
-        const SizedBox(height: 16),
         const _RecentPayslipsCard(),
         const SizedBox(height: 18),
         const Center(
@@ -81,18 +79,13 @@ class _SalaryView extends StatelessWidget {
     if (!showPayslip) return const SizedBox.shrink();
 
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Row(crossAxisAlignment: CrossAxisAlignment.start, children: const [
-          Expanded(flex: 6, child: _NetPayBanner(mobile: false)),
+      IntrinsicHeight(child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: const [
+          Expanded(child: _NetPayBanner(mobile: false)),
           SizedBox(width: 20),
           Expanded(
-            flex: 5,
-            child: Column(children: [
-              _SalaryOverviewCard(),
-              SizedBox(height: 18),
-              _SalaryBreakdownCard(),
-            ]),
+            child: _SalaryOverviewCard(),
           ),
-        ]),
+        ])),
       const SizedBox(height: 20),
       const _RecentPayslipsCard(),
       const SizedBox(height: 14),
@@ -133,6 +126,7 @@ Map<String, dynamic> _currentPayroll(Map<String, dynamic>? summary) {
   if (live.isNotEmpty) {
     return {
       'monthly_salary': live['monthlySalary'], 'deductions': live['deductions'],
+      'lop_days': live['lopDays'],
       'net_pay': live['netPay'], 'daily_rate': live['dailyRate'],
       'working_days': live['workingDays'], 'paid_days_to_date': live['paidDaysToDate'],
       'earned_to_date': live['earnedToDate'], 'status': '${live['status']}'.toLowerCase(),
@@ -186,7 +180,8 @@ class _NetPayBannerState extends State<_NetPayBanner> {
                 if (payroll.isEmpty)
                   Text(snapshot.data?['reviewRequired'] == true ? 'Payroll under review' : 'Payroll not generated', style: TextStyle(color: Colors.white, fontSize: widget.mobile ? 22 : 28, fontWeight: FontWeight.w700))
                 else ...[
-                  Text(_money(payroll['earned_to_date'] ?? payroll['net_pay'] ?? payroll['monthly_salary']), maxLines: 1, style: TextStyle(color: Colors.white, fontSize: widget.mobile ? 38 : 50, fontWeight: FontWeight.w800)),
+                  Text(_money(payroll['net_pay']), maxLines: 1, style: TextStyle(color: Colors.white, fontSize: widget.mobile ? 38 : 50, fontWeight: FontWeight.w800)),
+                  Text('Earned to Date: ${payroll['earned_to_date'] == null ? '–' : _money(payroll['earned_to_date'])}', style: const TextStyle(color: Colors.white)),
                   const SizedBox(height: 8),
                   Text('${payroll['pay_month']}/${payroll['pay_year']}',
                     style: TextStyle(
@@ -316,18 +311,22 @@ class _SalaryOverviewCardState extends State<_SalaryOverviewCard> {
                 const VerticalDivider(width: 1, color: employeeLine),
                 Expanded(child: _SalaryTile(
                   label: 'Deduction',
-                  value: '−${_money(payroll['deductions'])}',
+                  value: '−${_money(payroll['deductions'])} / ${payroll['lop_days'] ?? '–'} ${num.tryParse('${payroll['lop_days']}') == 1 ? 'day' : 'days'}',
                   valueColor: const Color(0xFFE05252),
                 )),
                 const VerticalDivider(width: 1, color: employeeLine),
                 Expanded(child: _SalaryTile(
                   label: 'Updated Salary',
-                  value: _money(payroll['earned_to_date'] ?? payroll['net_pay'] ?? payroll['monthly_salary']),
+                  value: _money(payroll['net_pay']),
                   valueColor: employeeBlue,
                   highlight: true,
                 )),
               ]),
             ),
+            const SizedBox(height: 10),
+            LabeledValue('Total Working Days', '${payroll['working_days'] ?? '–'}'),
+            const Divider(height: 1, color: employeeLine),
+            LabeledValue('Earned to Date', '${payroll['earned_to_date'] == null ? '–' : _money(payroll['earned_to_date'])} / ${payroll['paid_days_to_date'] ?? '–'} ${(num.tryParse('${payroll['paid_days_to_date']}') == 1) ? 'day' : 'days'}'),
           ],
         ]),
       ));
@@ -359,6 +358,10 @@ class _SalaryBreakdownCardState extends State<_SalaryBreakdownCard> {
             LabeledValue('Working Days', '${payroll['working_days'] ?? '–'}'), const Divider(height: 1, color: employeeLine),
             LabeledValue('Paid days to date', '${payroll['paid_days_to_date'] ?? '–'}'), const Divider(height: 1, color: employeeLine),
             LabeledValue('Leave Deduction', '−${_money(payroll['deductions'])}'),
+            const Divider(height: 1, color: employeeLine),
+            LabeledValue('Updated Salary', _money(payroll['net_pay'])),
+            const Divider(height: 1, color: employeeLine),
+            LabeledValue('Earned to Date', payroll['earned_to_date'] == null ? '–' : _money(payroll['earned_to_date'])),
           ],
         ]),
       ));

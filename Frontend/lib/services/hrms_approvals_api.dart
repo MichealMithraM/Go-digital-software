@@ -38,12 +38,16 @@ class HrmsApprovalsApi {
     String? tab,
     String employee = 'All Employees',
     String status = 'All Status',
+    String? startDate,
+    String? endDate,
   }) async {
     final uri = Uri.parse('${ApiConfig.baseUrl}/hrms/approvals').replace(
       queryParameters: {
         'tab': tab ?? (leaveTab ? 'leave' : 'extra'),
         'employee': employee,
         'status': status,
+        if (startDate != null) 'startDate': startDate,
+        if (endDate != null) 'endDate': endDate,
       },
     );
     final response = await http.get(uri, headers: await _headers());

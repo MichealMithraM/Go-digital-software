@@ -3,12 +3,15 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:godigital_portal/services/authenticated_http.dart' as http;
 import 'package:provider/provider.dart';
+import 'package:intl/intl.dart';
 
 import '../../../services/api_config.dart';
 import '../../../services/auth_service.dart';
 import '../../../services/hrms_approvals_api.dart';
 import '../../shared/widgets/admin_top_nav.dart';
 import '../../shared/widgets/admin_page_scroll_view.dart';
+
+part 'approvals_workspace.dart';
 
 abstract final class _ApprovalsColors {
   static const blue = Color(0xFF075EF7);
@@ -33,7 +36,8 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
   String employee = 'All Employees';
   String status = 'All Status';
   String dateRange = 'All Dates';
-  String period = 'This Month';
+  String period = 'Today';
+  DateTime _selectedDate = DateUtils.dateOnly(DateTime.now());
   String searchQuery = '';
   List<_ApprovalRequest> requests = [];
   List<String> employeeNames = const ['All Employees'];
@@ -48,6 +52,8 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
   int kpiRejected = 0;
   bool loading = true;
   String? error;
+  int _loadRequest = 0;
+  bool _loadedOnce = false;
 
   // Correction requests
   List<Map<String, dynamic>> _corrections = [];
@@ -115,15 +121,21 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
   }
 
   Future<void> _load() async {
+    final request = ++_loadRequest;
+    final selectedCategory = requestCategory;
+    final rangeStart = period == 'Today' ? _selectedDate : DateTime(_selectedDate.year, _selectedDate.month);
+    final rangeEnd = period == 'Today' ? _selectedDate : DateTime(_selectedDate.year, _selectedDate.month + 1, 0);
+    final startDate = DateFormat('yyyy-MM-dd').format(rangeStart);
+    final endDate = DateFormat('yyyy-MM-dd').format(rangeEnd);
     setState(() {
       loading = true;
       error = null;
     });
     try {
       final results = await Future.wait([
-        HrmsApprovalsApi.list(leaveTab: true, employee: employee, status: status),
-        HrmsApprovalsApi.list(leaveTab: false, employee: employee, status: status),
-        HrmsApprovalsApi.list(tab: 'permission', employee: employee, status: status),
+        HrmsApprovalsApi.list(leaveTab: true, employee: employee, status: status, startDate: startDate, endDate: endDate),
+        HrmsApprovalsApi.list(leaveTab: false, employee: employee, status: status, startDate: startDate, endDate: endDate),
+        HrmsApprovalsApi.list(tab: 'permission', employee: employee, status: status, startDate: startDate, endDate: endDate),
         HrmsApprovalsApi.list(leaveTab: true, employee: 'All Employees', status: 'pending'),
         HrmsApprovalsApi.list(leaveTab: false, employee: 'All Employees', status: 'pending'),
         HrmsApprovalsApi.list(tab: 'permission', employee: 'All Employees', status: 'pending'),
@@ -141,9 +153,10 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
       final names = <String>{'All Employees'};
       names.addAll((leave['employees'] as List? ?? []).map((e) => e.toString()));
       names.addAll((extra['employees'] as List? ?? []).map((e) => e.toString()));
-      if (!mounted) return;
+      names.addAll((permissions['employees'] as List? ?? []).map((e) => e.toString()));
+      if (!mounted || request != _loadRequest) return;
       setState(() {
-        requests = requestCategory == 'leave' ? leaveItems : requestCategory == 'extra' ? extraItems : permissionItems;
+        requests = selectedCategory == 'leave' ? leaveItems : selectedCategory == 'extra' ? extraItems : permissionItems;
         leaveCount = (leave['items'] as List? ?? []).length;
         extraCount = (extra['items'] as List? ?? []).length;
         permissionCount = (permissions['items'] as List? ?? []).length;
@@ -156,9 +169,10 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
         kpiApproved = _asInt(kpis['approved']);
         kpiRejected = _asInt(kpis['rejected']);
         loading = false;
+        _loadedOnce = true;
       });
     } catch (err) {
-      if (!mounted) return;
+      if (!mounted || request != _loadRequest) return;
       setState(() {
         error = err.toString().replaceFirst('Exception: ', '');
         loading = false;
@@ -206,7 +220,7 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
         children: [
           const AdminTopNav(activeRoute: '/admin/approvals'),
           Expanded(
-            child: loading && requests.isEmpty
+            child: loading && !_loadedOnce
                 ? const Center(child: CircularProgressIndicator())
                 : error != null && requests.isEmpty
                     ? Center(
@@ -222,7 +236,32 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
                           ],
                         ),
                       )
-                    : AdminPageScrollView(
+                    : MediaQuery.sizeOf(context).width >= 1000
+                        ? _ApprovalsWorkspace(
+                            category: _activeTab == 1 ? 'corrections' : requestCategory,
+                            counts: [_pendingLeaveCount, _pendingPermissionCount, _pendingExtraCount, _correctionsPendingCount],
+                            requests: requests.where((r) {
+                              final q = searchQuery.trim().toLowerCase();
+                              return (q.isEmpty || '${r.name} ${r.id} ${r.type} ${r.reason}'.toLowerCase().contains(q)) && _matchesPeriod(r, period, selected: _selectedDate);
+                            }).toList(),
+                            employees: employeeNames, employee: employee, status: status, period: period,
+                            loading: loading, error: error,
+                            onCategory: (value) { setState(() { _activeTab = value == 'corrections' ? 1 : 0; if (_activeTab == 0) requestCategory = value; }); if (_activeTab == 1) { _loadCorrections(); } else { _load(); } },
+                            onSearch: (value) => setState(() => searchQuery = value),
+                            onEmployee: (value) { employee = value; _load(); },
+                            onStatus: (value) { status = value; _load(); },
+                            onPeriod: (value) { setState(() => period = value); _load(); },
+                            selectedDate: _selectedDate,
+                            onDate: (value) { setState(() => _selectedDate = value); _load(); },
+                            onReset: () { setState(() { searchQuery = ''; employee = 'All Employees'; status = 'All Status'; period = 'Today'; _selectedDate = DateUtils.dateOnly(DateTime.now()); }); _load(); },
+                            onReview: _updateStatus,
+                            corrections: _CorrectionRequestsPanel(corrections: _corrections.where((c) {
+                              final d = DateTime.tryParse('${c['attendance_date']}');
+                              if (d == null) return true;
+                              return d.year == _selectedDate.year && d.month == _selectedDate.month && (period != 'Today' || d.day == _selectedDate.day);
+                            }).toList(), loading: _correctionsLoading, onApprove: (id) => _reviewCorrection(id, 'approve'), onReject: (id) => _reviewCorrection(id, 'reject')),
+                          )
+                        : AdminPageScrollView(
                         padding: EdgeInsets.fromLTRB(
                             mobile ? 16 : 28, 18, mobile ? 16 : 28, 28),
                         child: Center(
@@ -278,7 +317,7 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
                                   requestCategory: requestCategory,
                                   requests: requests.where((request) {
                                     final query = searchQuery.trim().toLowerCase();
-                                    return (query.isEmpty || request.name.toLowerCase().contains(query) || request.id.toLowerCase().contains(query) || request.type.toLowerCase().contains(query)) && _matchesPeriod(request, period);
+                                    return (query.isEmpty || request.name.toLowerCase().contains(query) || request.id.toLowerCase().contains(query) || request.type.toLowerCase().contains(query)) && _matchesPeriod(request, period, selected: _selectedDate);
                                   }).toList(),
                                   searchQuery: searchQuery,
                                   onSearch: (value) => setState(() => searchQuery = value),
@@ -299,12 +338,12 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
                                     dateRange = value!;
                                     setState(() {});
                                   },
-                                  onPeriodChanged: (value) => setState(() => period = value),
+                                  onPeriodChanged: (value) { setState(() => period = value); _load(); },
                                   onReset: () {
                                     employee = 'All Employees';
                                     status = 'All Status';
                                     dateRange = 'All Dates';
-                                    period = 'This Month';
+                                    period = 'Today';
                                     _load();
                                   },
                                   onApprove: (request) =>
@@ -1281,17 +1320,18 @@ class _PaginationButton extends StatelessWidget {
       );
 }
 
-bool _matchesPeriod(_ApprovalRequest request, String period) {
+bool _matchesPeriod(_ApprovalRequest request, String period, {DateTime? selected}) {
   if (period == 'All') return true;
   final match = RegExp(r'(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})').firstMatch(request.dates);
   if (match == null) return true;
   const months = <String, int>{'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12};
   final date = DateTime.tryParse('${match.group(3)}-${months[match.group(2)!.toLowerCase().substring(0, 3)]?.toString().padLeft(2, '0')}-${match.group(1)!.padLeft(2, '0')}');
   if (date == null) return true;
-  final now = DateTime.now();
+  final now = selected ?? DateTime.now();
+  final end = request.endDate ?? date;
   return period == 'Today'
-      ? date.year == now.year && date.month == now.month && date.day == now.day
-      : date.year == now.year && date.month == now.month;
+      ? !date.isAfter(DateUtils.dateOnly(now)) && !end.isBefore(DateUtils.dateOnly(now))
+      : date.isBefore(DateTime(now.year, now.month + 1)) && !end.isBefore(DateTime(now.year, now.month));
 }
 
 class _ApprovalRequest {
@@ -1309,6 +1349,7 @@ class _ApprovalRequest {
     required this.icon,
     required this.color,
     this.homeDetails,
+    this.endDate,
   });
 
   final int requestId;
@@ -1318,6 +1359,7 @@ class _ApprovalRequest {
   final IconData icon;
   final int color;
   final String? homeDetails;
+  final DateTime? endDate;
 
   factory _ApprovalRequest.fromApi(Map<String, dynamic> json) {
     int asInt(dynamic value) =>
@@ -1348,6 +1390,7 @@ class _ApprovalRequest {
       },
       color: json['color'] is int ? json['color'] as int : 0xFF7137E8,
       homeDetails: homeDetails,
+      endDate: DateTime.tryParse('${json['endDate']}'),
     );
   }
 }

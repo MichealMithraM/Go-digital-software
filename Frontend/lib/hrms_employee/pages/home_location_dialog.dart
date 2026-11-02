@@ -1,8 +1,12 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'home_location_picker.dart';
 
 import '../../services/attendance_location.dart';
 import '../../services/hrms_tracking_api.dart';
+import '../../services/home_location_capture.dart';
 
 /// Registration is explicit: opening this dialog never collects or saves GPS.
 class HomeLocationDialog extends StatefulWidget {
@@ -16,14 +20,21 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
   final _addressController = TextEditingController();
   Map<String, dynamic>? _home;
   Position? _position;
+  HomeMapSelection? _mapSelection;
   bool _loading = true;
   bool _capturing = false;
   bool _saving = false;
+  bool _selectingMap = false;
   bool _loadFailed = false;
   String? _error;
   String? _notice;
+  double? _maximumAccuracy;
 
-  bool get _busy => _capturing || _saving;
+  String _message(Object error) => error is TimeoutException
+      ? 'The server did not respond in time. Check your internet connection and retry.'
+      : error.toString().replaceFirst('Exception: ', '');
+
+  bool get _busy => _capturing || _saving || _selectingMap;
 
   @override
   void initState() {
@@ -56,7 +67,7 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
       setState(() {
         _loading = false;
         _loadFailed = true;
-        _error = error.toString().replaceFirst('Exception: ', '');
+        _error = _message(error);
       });
     }
   }
@@ -68,24 +79,79 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
       _error = null;
       _notice = null;
       _position = null;
+      _mapSelection = null;
     });
     try {
+      final settings = await HrmsTrackingApi.trackingSettings().timeout(
+        const Duration(seconds: 15),
+      );
+      if (!mounted) return;
+      final limit = double.tryParse('${settings['home_radius_meters']}');
+      if (limit == null || !limit.isFinite || limit <= 0) {
+        throw const AttendanceLocationError(
+          'Ask your admin to configure the Home radius.',
+        );
+      }
+      setState(() => _maximumAccuracy = limit);
       final position = await AttendanceLocation.currentPosition();
       if (!mounted) return;
       setState(() => _position = position);
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _error = error.toString().replaceFirst('Exception: ', '');
+        _error = _message(error);
       });
     } finally {
       if (mounted) setState(() => _capturing = false);
     }
   }
 
+  Future<void> _selectMap() async {
+    if (_busy) return;
+    setState(() {
+      _selectingMap = true;
+      _error = null;
+      _notice = null;
+    });
+    try {
+      final lat = double.tryParse('${_home?['latitude']}');
+      final lng = double.tryParse('${_home?['longitude']}');
+      final selection = await showDialog<HomeMapSelection>(
+        context: context,
+        builder: (_) => HomeLocationPicker(
+          center:
+              _mapSelection?.point ??
+              (lat != null && lng != null ? LatLng(lat, lng) : null),
+          address: _addressController.text,
+        ),
+      );
+      if (!mounted || selection == null) return;
+      setState(() {
+        _position = null;
+        _mapSelection = selection;
+        _addressController.text = selection.address;
+        _notice =
+            'Map-selected location. Submit it for admin verification; Home check-in remains blocked until approval.';
+      });
+    } finally {
+      if (mounted) setState(() => _selectingMap = false);
+    }
+  }
+
   Future<void> _submit() async {
     final position = _position;
-    if (_busy || position == null) return;
+    final selection = _mapSelection;
+    if (_busy || (position == null && selection == null)) return;
+    if (selection == null &&
+        (_maximumAccuracy == null ||
+            !validHomePosition(position!, _maximumAccuracy!))) {
+      setState(() {
+        _position = null;
+        _error =
+            'Capture a fresh, precise Home GPS location before submitting.';
+      });
+      return;
+    }
     setState(() {
       _saving = true;
       _error = null;
@@ -93,23 +159,28 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
     });
     try {
       await HrmsTrackingApi.submitHomeLocation(
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        capturedAt: position.timestamp.toUtc().toIso8601String(),
+        latitude: selection?.point.latitude ?? position!.latitude,
+        longitude: selection?.point.longitude ?? position!.longitude,
+        accuracy: selection == null ? position!.accuracy : null,
+        capturedAt: selection == null
+            ? position!.timestamp.toUtc().toIso8601String()
+            : null,
+        captureSource: selection == null ? 'gps' : 'map_pin',
         address: _addressController.text.trim(),
       );
       if (!mounted) return;
       setState(() {
         _home = {
           ...?_home,
-          'latitude': position.latitude,
-          'longitude': position.longitude,
+          'latitude': selection?.point.latitude ?? position!.latitude,
+          'longitude': selection?.point.longitude ?? position!.longitude,
+          'capture_source': selection == null ? 'gps' : 'map_pin',
           'address': _addressController.text.trim(),
           'approval_status': 'pending',
           'rejection_reason': null,
         };
         _position = null;
+        _mapSelection = null;
         _notice =
             'Home location submitted. An admin must approve it before '
             'Home Check In is available.';
@@ -117,8 +188,25 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
       await _load();
     } catch (error) {
       if (!mounted) return;
+      if (error is TimeoutException) {
+        // A timed-out response does not prove that the server rejected the save.
+        final editedAddress = _addressController.text;
+        await _load();
+        if (!mounted) return;
+        _addressController.text = editedAddress;
+        setState(() {
+          _position = null;
+          _mapSelection = null;
+          if (!_loadFailed) {
+            _error =
+                'The submission response timed out. The saved status above '
+                'has been refreshed. Check it before capturing and submitting again.';
+          }
+        });
+        return;
+      }
       setState(() {
-        _error = error.toString().replaceFirst('Exception: ', '');
+        _error = _message(error);
       });
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -165,7 +253,7 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
                       if (_home != null) ...[
                         const SizedBox(height: 8),
                         SelectableText(
-                          'Registered GPS: '
+                          'Registered Home: '
                           '${_coordinates(_home!['latitude'], _home!['longitude'])}',
                         ),
                         if (status == 'rejected' &&
@@ -177,8 +265,7 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
                       if (!_loadFailed) ...[
                         const SizedBox(height: 16),
                         const Text(
-                          'When you are at home, capture your current '
-                          'GPS location and submit it for approval.',
+                          'Capture your GPS while at home, or select your home on the map. Submit the location for admin approval.',
                         ),
                         if (status == 'approved') ...[
                           const SizedBox(height: 8),
@@ -203,12 +290,23 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
                         OutlinedButton.icon(
                           onPressed: _busy ? null : _capture,
                           icon: const Icon(Icons.my_location),
-                          label: Text(
-                            _capturing
-                                ? 'Getting location...'
-                                : 'Capture Home GPS',
-                          ),
+                          label: Text(_capturing ? 'Finding location...' : 'Capture Home GPS'),
                         ),
+                        const SizedBox(height: 8),
+                        OutlinedButton.icon(
+                          onPressed: _busy ? null : _selectMap,
+                          icon: const Icon(Icons.pin_drop_outlined),
+                          label: const Text('Select Home on Map'),
+                        ),
+                        if (_mapSelection != null) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'Selected on map: ${_coordinates(_mapSelection!.point.latitude, _mapSelection!.point.longitude)}',
+                          ),
+                          const Text(
+                            'Admin verification required. This is a map pin, not a GPS reading.',
+                          ),
+                        ],
                         if (_position != null) ...[
                           const SizedBox(height: 8),
                           SelectableText(
@@ -252,7 +350,11 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
             child: const Text('Close'),
           ),
           FilledButton(
-            onPressed: _loading || _loadFailed || _busy || _position == null
+            onPressed:
+                _loading ||
+                    _loadFailed ||
+                    _busy ||
+                    (_position == null && _mapSelection == null)
                 ? null
                 : _submit,
             child: Text(

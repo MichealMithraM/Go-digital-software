@@ -474,13 +474,14 @@ class _DynamicSalaryActionState extends State<_DynamicSalaryAction> {
       final live = snapshot.data?['livePayroll'];
       final map = payroll is Map ? payroll : const <String, dynamic>{};
       final liveMap = live is Map ? live : const <String, dynamic>{};
-      final updatedSalary = liveMap['earnedToDate'] ?? map['net_pay'] ?? map['monthly_salary'];
+      final updatedSalary = liveMap['netPay'] ?? map['net_pay'];
       return _Actions(
         'SALARY',
         const Color(0xFF07368D),
         Icons.currency_rupee_rounded,
         [
           ('Updated Salary ${_money(updatedSalary)}', Icons.currency_rupee_rounded, null),
+          ('Earned to Date ${_money(liveMap['earnedToDate'] ?? map['earned_to_date'])}', Icons.currency_rupee_rounded, null),
           ('View Payslip', Icons.description_outlined, '/employee/salary'),
         ],
       );

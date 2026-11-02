@@ -53,6 +53,7 @@ class AttendanceRowData {
   final String totalSalaryAfterLeaves;
   final num? deductedDays;
   final String updatedSalary;
+  final String earnedToDate;
   final num? creditedDays;
 
   const AttendanceRowData({
@@ -72,6 +73,7 @@ class AttendanceRowData {
     required this.totalSalaryAfterLeaves,
     this.deductedDays,
     required this.updatedSalary,
+    this.earnedToDate = '–',
     this.creditedDays,
   });
 }
@@ -180,11 +182,11 @@ class AttendanceGrid extends StatelessWidget {
                     ),
                     _bCell(
                       summaryWidths[9],
-                      AttendanceDeductionValue(
-                        amount: row.updatedSalary,
+                      Column(mainAxisSize: MainAxisSize.min, children: [Text(row.updatedSalary, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)), AttendanceDeductionValue(
+                        amount: 'Earned: ${row.earnedToDate}',
                         days: row.creditedDays,
                         daysSuffix: 'credited',
-                      ),
+                      )]),
                     ),
                   ],
                 ],

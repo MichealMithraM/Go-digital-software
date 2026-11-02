@@ -48,7 +48,7 @@ test('dashboard salary and deducted days come from the shared payroll result', a
   reset();
   fixture.payroll = [{ employeeUserId: 7, monthlySalary: 33600, salary: '₹33,600', dailyRate: 1600,
     workingDays: 21, lopDays: 2.5, paidDays: 18.5, paidDaysToDate: 9.5, deductions: 4000,
-    deductionsLabel: '₹4,000', earnedToDateLabel: '₹15,200' }];
+    deductionsLabel: '₹4,000', netPayLabel: '₹29,600', earnedToDateLabel: '₹15,200' }];
   const [row] = await month();
   assert.deepEqual(fixture.calculation, [2026, 10, '2026-12-31']);
   assert.equal(row.salary, '₹33,600');
@@ -56,7 +56,8 @@ test('dashboard salary and deducted days come from the shared payroll result', a
   assert.equal(row.deductedDays, 2.5);
   assert.equal(row.daysPaid, '2.5');
   assert.equal(row.afterLeaves, '₹4,000');
-  assert.equal(row.updatedSalary, '₹15,200');
+  assert.equal(row.updatedSalary, '₹29,600');
+  assert.equal(row.earnedToDate, '₹15,200');
   assert.equal(row.creditedDays, 9.5);
 });
 
@@ -77,7 +78,7 @@ test('different selected months use their own payroll values', async () => {
 test('paid payroll uses the saved credited days matching its saved salary', async () => {
   reset();
   fixture.payroll = [{ employeeUserId: 7, status: 'Paid', monthlySalary: 33600,
-    paidDays: 18.5, paidDaysToDate: 9.5, earnedToDateLabel: '₹29,600' }];
+    paidDays: 18.5, paidDaysToDate: 9.5, netPayLabel: '₹29,600', earnedToDateLabel: '₹29,600' }];
   const [row] = await month();
   assert.equal(row.updatedSalary, '₹29,600');
   assert.equal(row.creditedDays, 18.5);
@@ -89,6 +90,16 @@ test('zero credited days are preserved and missing counts are not invented', asy
   assert.equal((await month())[0].creditedDays, 0);
   delete fixture.payroll[0].paidDaysToDate;
   assert.equal((await month())[0].creditedDays, null);
+});
+
+test('monthly updated salary remains separate from zero earned salary', async () => {
+  reset();
+  fixture.payroll = [{ employeeUserId: 7, monthlySalary: 50000, deductionsLabel: '₹2,000',
+    netPayLabel: '₹48,000', earnedToDateLabel: '₹0', paidDaysToDate: 0 }];
+  const [row] = await month();
+  assert.equal(row.updatedSalary, '₹48,000');
+  assert.equal(row.earnedToDate, '₹0');
+  assert.equal(row.creditedDays, 0);
 });
 
 test('daily salary fallback follows configured weekly offs and holidays', async () => {

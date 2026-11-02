@@ -1,4 +1,5 @@
 async function ensureHrmsTrackingTables(db) {
+  await require('./ensureHomeLocationTables').ensureHomeLocationTables(db);
   await db.query(`
     CREATE TABLE IF NOT EXISTS hrms_tracking_settings (
       id TINYINT PRIMARY KEY,

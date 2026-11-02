@@ -1810,12 +1810,12 @@ class _LiveMapState extends State<_LiveMap> {
           _officeAddress = (data['office_address'] ?? data['officeAddress'])
               ?.toString();
           _officeRadiusMeters = radius;
-          if (officeView || _located.isEmpty) {
+          if (officeView) {
             _center = _officeCenter!;
             _zoom = 15;
           }
         });
-        if (officeView || _located.isEmpty) {
+        if (officeView) {
           _controller?.animateCamera(
             CameraUpdate.newLatLngZoom(_officeCenter!, 15),
           );
@@ -1834,13 +1834,14 @@ class _LiveMapState extends State<_LiveMap> {
     super.didUpdateWidget(oldWidget);
     final newHighlight = widget.highlightedEmployee;
     final oldHighlight = oldWidget.highlightedEmployee;
-    if (newHighlight?.employeeUserId != oldHighlight?.employeeUserId &&
+    if ((newHighlight?.employeeUserId != oldHighlight?.employeeUserId || newHighlight?.homeLat != oldHighlight?.homeLat || newHighlight?.homeLng != oldHighlight?.homeLng) &&
         newHighlight?.homeLat != null &&
         newHighlight?.homeLng != null &&
         _located.isEmpty) {
       _moveTo(LatLng(newHighlight!.homeLat!, newHighlight.homeLng!), 14);
     } else if (oldWidget.employees != widget.employees && _located.isNotEmpty) {
       _center = _initialCenter;
+      if (newHighlight != null && (newHighlight.lat != oldHighlight?.lat || newHighlight.lng != oldHighlight?.lng)) _moveTo(_center);
     }
   }
 
@@ -1857,7 +1858,7 @@ class _LiveMapState extends State<_LiveMap> {
     if (h?.homeLat != null && h?.homeLng != null) {
       return LatLng(h!.homeLat!, h.homeLng!);
     }
-    return _officeCenter ?? _fallbackCenter;
+    return widget.highlightedEmployee == null ? (_officeCenter ?? _fallbackCenter) : _fallbackCenter;
   }
 
   Future<void> _moveTo(LatLng target, [double? zoom]) async {
@@ -1892,7 +1893,7 @@ class _LiveMapState extends State<_LiveMap> {
             },
             mapToolbarEnabled: false,
             circles: {
-              if (_officeCenter != null && (_officeRadiusMeters ?? 0) > 0)
+              if (widget.highlightedEmployee == null && _officeCenter != null && (_officeRadiusMeters ?? 0) > 0)
                 Circle(
                   circleId: const CircleId('__office_geofence__'),
                   center: _officeCenter!,
@@ -1918,7 +1919,7 @@ class _LiveMapState extends State<_LiveMap> {
                   onTap: () => widget.onViewRoute(employee),
                 ),
               ),
-              if (_officeCenter != null)
+              if (widget.highlightedEmployee == null && _officeCenter != null)
                 Marker(
                   markerId: const MarkerId('__office__'),
                   position: _officeCenter!,
@@ -1975,7 +1976,7 @@ class _LiveMapState extends State<_LiveMap> {
           ),
           if (widget.showEmptyOverlay &&
               _located.isEmpty &&
-              _officeCenter == null &&
+              (widget.highlightedEmployee != null || _officeCenter == null) &&
               (widget.highlightedEmployee?.homeLat == null ||
                   widget.highlightedEmployee?.homeLng == null))
             const Center(
@@ -2585,8 +2586,8 @@ class _TrackedEmployee {
     this.homeApprovalStatus,
     this.homeDistanceMeters,
     this.officeDistanceMeters,
-    this.homeRadiusMeters = 100,
-    this.officeRadiusMeters = 100,
+    this.homeRadiusMeters,
+    this.officeRadiusMeters,
     this.accuracyMeters,
     this.attendanceDate,
     this.recentAttendance = const [],
@@ -2614,8 +2615,8 @@ class _TrackedEmployee {
   final String? homeApprovalStatus;
   final double? homeDistanceMeters;
   final double? officeDistanceMeters;
-  final double homeRadiusMeters;
-  final double officeRadiusMeters;
+  final double? homeRadiusMeters;
+  final double? officeRadiusMeters;
   final double? accuracyMeters;
   final String? attendanceDate;
   final List<_AttendanceDay> recentAttendance;
@@ -2628,13 +2629,13 @@ class _TrackedEmployee {
   final double? homeLng;
 
   factory _TrackedEmployee.fromApi(Map<String, dynamic> json) {
-    final rawStatus = (json['status'] ?? 'office').toString();
+    final rawStatus = (json['status'] ?? '').toString();
     final mode =
         rawStatus.toLowerCase() == 'field' ||
             rawStatus.toLowerCase() == 'hybrid'
         ? 'Hybrid'
         : rawStatus.isEmpty
-        ? 'Office'
+        ? 'Unknown'
         : rawStatus[0].toUpperCase() + rawStatus.substring(1).toLowerCase();
     final rawUpdated = json['lastUpdated'];
     final lastUpdated = rawUpdated != null
@@ -2678,12 +2679,10 @@ class _TrackedEmployee {
           (json['office_distance_meters'] as num?)?.toDouble(),
       homeRadiusMeters:
           (json['homeRadiusMeters'] as num?)?.toDouble() ??
-          (json['home_radius_meters'] as num?)?.toDouble() ??
-          100,
+          (json['home_radius_meters'] as num?)?.toDouble(),
       officeRadiusMeters:
           (json['officeRadiusMeters'] as num?)?.toDouble() ??
-          (json['office_radius_meters'] as num?)?.toDouble() ??
-          100,
+          (json['office_radius_meters'] as num?)?.toDouble(),
       accuracyMeters:
           (json['accuracyMeters'] as num?)?.toDouble() ??
           (json['accuracy_meters'] as num?)?.toDouble(),

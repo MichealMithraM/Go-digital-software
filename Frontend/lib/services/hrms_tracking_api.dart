@@ -23,8 +23,8 @@ class HrmsTrackingApi {
   static Future<void> submitHomeLocation({
     required double latitude,
     required double longitude,
-    required double accuracy,
-    required String capturedAt,
+    double? accuracy,
+    String? capturedAt,
     String captureSource = 'gps',
     String? address,
   }) async {
@@ -65,6 +65,8 @@ class HrmsTrackingApi {
     required double latitude,
     required double longitude,
     String? rejectionReason,
+    bool mapPinVerified = false,
+    String? reviewedAddress,
   }) async {
     final response = await http
         .patch(
@@ -77,6 +79,8 @@ class HrmsTrackingApi {
             'latitude': latitude,
             'longitude': longitude,
             'rejectionReason': rejectionReason,
+            'mapPinVerified': mapPinVerified,
+            'reviewedAddress': reviewedAddress,
           }),
         )
         .timeout(const Duration(seconds: 15));

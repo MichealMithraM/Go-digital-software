@@ -3,6 +3,7 @@ const { configuredNumber } = require('../lib/configuredSetting');
 const nullableNumber = value => value == null || String(value).trim() === '' ? null : Number(value);
 const policy = require('../lib/attendancePolicy');
 const locationPolicy = require('../lib/attendanceLocationPolicy');
+const { validateHomeRegistration } = require('../lib/homeLocationRegistration');
 
 function ok(res, data, message) {
   return res.json({ success: true, message: message || 'OK', data: data });
@@ -202,7 +203,6 @@ async function list(req, res) {
   }
 }
 
-const ACTIVE_WINDOW_MINUTES = 15;
 const GEOCODE_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h; rounded coords repeat a lot
 const geocodeCache = new Map();
 const routeCache = new Map();
@@ -634,12 +634,39 @@ async function ping(req, res) {
 
 async function liveOverview(req, res) {
   try {
+    const today = policy.todayIstDate();
+    const date = String(req.query.date || today);
+    const parsedDate = new Date(date + 'T00:00:00Z');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== date) return fail(res, 400, 'date must be YYYY-MM-DD');
+    const monthStart = date.slice(0, 7) + '-01';
+    await require('../lib/employeeLifecycle').ensureLifecycle();
     const [profiles] = await db.query(`
-      SELECT id, employee_user_id, full_name, employee_code
-      FROM hrms_employee_profiles
-      WHERE employment_status <> 'Inactive'
-    `);
+      SELECT p.id, p.employee_user_id, p.full_name, p.employee_code, p.work_mode
+      FROM hrms_employee_profiles p
+      WHERE EXISTS (SELECT 1 FROM employee_employment_periods e WHERE e.employee_user_id=p.employee_user_id
+        AND e.started_on<=? AND (e.ended_on IS NULL OR e.ended_on>=?))
+    `, [date, date]);
     const userIds = profiles.map(function (row) { return row.employee_user_id; }).filter(Boolean);
+    const [[settings = {}]] = await db.query('SELECT * FROM hrms_tracking_settings WHERE id = 1 LIMIT 1');
+    const [attendance] = userIds.length ? await db.query(
+      `SELECT r.*, DATE_FORMAT(attendance_date, '%Y-%m-%d') AS date_key,
+        CONCAT(DATE_FORMAT(check_in_at, '%Y-%m-%dT%H:%i:%s'), '+05:30') AS check_in_iso,
+        CONCAT(DATE_FORMAT(check_out_at, '%Y-%m-%dT%H:%i:%s'), '+05:30') AS check_out_iso
+       FROM attendance_records r WHERE employee_id IN (?) AND attendance_date BETWEEN ? AND ? ORDER BY attendance_date DESC, id DESC`,
+      [userIds, monthStart, date]) : [[]];
+    const [openBreaks] = userIds.length ? await db.query(
+      `SELECT b.attendance_id FROM attendance_breaks b
+       INNER JOIN attendance_records r ON r.id = b.attendance_id
+       WHERE r.employee_id IN (?) AND r.attendance_date = ? AND b.status = 'active' AND b.ended_at IS NULL`,
+      [userIds, date]).catch(error => {
+        // An installation with no break table cannot have recorded breaks yet.
+        if (error.code === 'ER_NO_SUCH_TABLE' && String(error.sqlMessage || error.message).includes('attendance_breaks')) return [[]];
+        throw error;
+      }) : [[]];
+    const openBreakIds = new Set(openBreaks.map(b => Number(b.attendance_id)));
+    const [homes] = userIds.length ? await db.query(
+      'SELECT employee_user_id, latitude, longitude, address, approval_status FROM hrms_employee_home_locations WHERE employee_user_id IN (?)', [userIds]) : [[]];
+    const homeMap = new Map(homes.map(h => [Number(h.employee_user_id), h]));
 
     const [statuses] = userIds.length
       ? await db.query(
@@ -653,16 +680,17 @@ async function liveOverview(req, res) {
 
     const [latestPings] = userIds.length
       ? await db.query(
-          `SELECT p.employee_user_id, p.latitude, p.longitude, p.address, p.recorded_at
+          `SELECT p.employee_user_id, p.latitude, p.longitude, p.address, p.recorded_at, p.accuracy_meters,
+                  CONCAT(DATE_FORMAT(p.recorded_at, '%Y-%m-%dT%H:%i:%s'), '+05:30') AS recorded_iso
            FROM hrms_location_pings p
            INNER JOIN (
-             SELECT employee_user_id, MAX(recorded_at) AS max_time
+             SELECT employee_user_id, MAX(id) AS latest_id
              FROM hrms_location_pings
-             WHERE employee_user_id IN (?)
+             WHERE employee_user_id IN (?) AND recorded_at >= ? AND recorded_at < DATE_ADD(?, INTERVAL 1 DAY)
              GROUP BY employee_user_id
            ) latest
-           ON latest.employee_user_id = p.employee_user_id AND latest.max_time = p.recorded_at`,
-          [userIds]
+           ON latest.employee_user_id = p.employee_user_id AND latest.latest_id = p.id`,
+          [userIds, date, date]
         )
       : [[]];
     const pingMap = new Map();
@@ -674,14 +702,18 @@ async function liveOverview(req, res) {
 
     const items = profiles.map(function (profile) {
       const uid = profile.employee_user_id ? Number(profile.employee_user_id) : null;
-      const status = (uid && statusMap.get(uid)) || 'office';
+      const history = attendance.filter(r => Number(r.employee_id) === uid);
+      const record = history.find(r => r.date_key === date);
+      const status = String((record && record.work_mode_snapshot) || (uid && statusMap.get(uid)) || profile.work_mode || '').toLowerCase().replace('field', 'hybrid');
       const ping = uid ? pingMap.get(uid) : null;
+      const home = uid ? homeMap.get(uid) : null;
       counts[status] = (counts[status] || 0) + 1;
 
       let isActive = false;
-      if (ping && ping.recorded_at) {
-        const ageMinutes = (now - new Date(ping.recorded_at).getTime()) / 60000;
-        isActive = ageMinutes <= ACTIVE_WINDOW_MINUTES;
+      if (date === today && record && record.check_in_iso && !record.check_out_iso && ping && ping.recorded_iso) {
+        const ageMinutes = (now - new Date(ping.recorded_iso).getTime()) / 60000;
+        const timeout = nullableNumber(settings[status === 'home' ? 'home_no_gps_timeout_minutes' : status === 'office' ? 'office_no_gps_timeout_minutes' : 'field_ping_interval_minutes']);
+        isActive = Number.isFinite(timeout) && timeout > 0 && ageMinutes >= 0 && ageMinutes <= timeout && new Date(ping.recorded_iso) >= new Date(record.check_in_iso);
       }
       if (isActive) activeNow += 1;
 
@@ -693,12 +725,30 @@ async function liveOverview(req, res) {
         latitude: ping ? Number(ping.latitude) : null,
         longitude: ping ? Number(ping.longitude) : null,
         address: ping ? ping.address : null,
-        lastUpdated: ping ? ping.recorded_at : null,
+        lastUpdated: ping ? ping.recorded_iso : null,
         active: isActive,
+        attendanceDate: date,
+        checkInAt: record ? record.check_in_iso : null,
+        checkOutAt: record ? record.check_out_iso : null,
+        isLate: Boolean(record && Number(record.is_late)),
+        onBreak: Boolean(record && record.check_in_iso && !record.check_out_iso && openBreakIds.has(Number(record.id))),
+        sessionStatus: record ? record.session_status : null,
+        attendanceStatus: record ? record.attendance_status : null,
+        checkInMethod: record ? record.check_in_method : null,
+        workingMinutes: record ? nullableNumber(record.working_minutes) : null,
+        accuracyMeters: ping ? nullableNumber(ping.accuracy_meters) : null,
+        homeApprovalStatus: home ? home.approval_status : null,
+        homeLatitude: home && home.approval_status === 'approved' ? nullableNumber(home.latitude) : null,
+        homeLongitude: home && home.approval_status === 'approved' ? nullableNumber(home.longitude) : null,
+        homeAddress: home && home.approval_status === 'approved' ? home.address : null,
+        homeRadiusMeters: nullableNumber(settings.home_radius_meters),
+        officeRadiusMeters: nullableNumber(settings.office_radius_meters),
+        recentAttendance: history.map(r => ({ date: r.date_key, checkInAt: r.check_in_iso, checkOutAt: r.check_out_iso, status: r.attendance_status, method: r.check_in_method })),
       };
     });
 
     return ok(res, {
+      date,
       counts: {
         office: counts.office || 0,
         home: counts.home || 0,
@@ -895,7 +945,7 @@ async function getMyHomeLocation(req, res) {
 
     const [rows] = await db.query(
       `SELECT employee_user_id, latitude, longitude, address,
-              approval_status, submitted_at, reviewed_at, rejection_reason
+              approval_status, submitted_at, reviewed_at, rejection_reason, capture_source, accuracy_meters
        FROM hrms_employee_home_locations
        WHERE employee_user_id = ?`,
       [employeeUserId]
@@ -924,23 +974,25 @@ async function submitHomeLocation(req, res) {
     await connection.beginTransaction();
     await locationPolicy.profileFor(connection, employeeUserId, true);
     const settings = await locationPolicy.settingsFor(connection, true, 'Home');
-    const fix = locationPolicy.validateFix(body, settings.homeRadiusMeters);
+    const fix = validateHomeRegistration(body, settings.homeRadiusMeters);
 
     await connection.query(
       `INSERT INTO hrms_employee_home_locations
-        (employee_user_id, latitude, longitude, address, approval_status)
-       VALUES (?, ?, ?, ?, 'pending')
+        (employee_user_id, latitude, longitude, address, capture_source, accuracy_meters, approval_status)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending')
        ON DUPLICATE KEY UPDATE
          latitude = VALUES(latitude),
          longitude = VALUES(longitude),
          address = VALUES(address),
+         capture_source = VALUES(capture_source),
+         accuracy_meters = VALUES(accuracy_meters),
          approval_status = 'pending',
          reviewed_by = NULL,
          reviewed_at = NULL,
          rejection_reason = NULL,
          submitted_at = CURRENT_TIMESTAMP,
          updated_at = CURRENT_TIMESTAMP`,
-      [employeeUserId, fix.latitude, fix.longitude, address || null]
+      [employeeUserId, fix.latitude, fix.longitude, address || null, fix.captureSource, fix.accuracy]
     );
     await connection.commit();
     return ok(res, null, 'Home location submitted for admin approval');
@@ -962,7 +1014,7 @@ async function listHomeLocations(req, res) {
     const [rows] = await db.query(`
       SELECT h.employee_user_id, h.latitude, h.longitude, h.address,
              h.approval_status, h.submitted_at, h.reviewed_at,
-             h.rejection_reason, p.full_name, p.employee_code
+             h.rejection_reason, h.capture_source, h.accuracy_meters, p.full_name, p.employee_code
       FROM hrms_employee_home_locations h
       LEFT JOIN hrms_employee_profiles p
         ON p.employee_user_id = h.employee_user_id
@@ -1009,13 +1061,20 @@ async function reviewHomeLocation(req, res) {
     await connection.beginTransaction();
     const profile = await locationPolicy.profileFor(connection, employeeUserId, true);
     const [homes] = await connection.query(
-      `SELECT latitude, longitude, approval_status FROM hrms_employee_home_locations
+      `SELECT latitude, longitude, address, approval_status, capture_source FROM hrms_employee_home_locations
        WHERE employee_user_id = ? FOR UPDATE`, [employeeUserId]);
     if (homes.length !== 1) {
       throw new locationPolicy.LocationPolicyError(404, 'Home location request not found.');
     }
     if (homes[0].approval_status !== 'pending') {
       throw new locationPolicy.LocationPolicyError(409, 'This Home location request was already reviewed. Refresh the list.');
+    }
+    if (approvalStatus === 'approved' && homes[0].capture_source === 'map_pin' && body.mapPinVerified !== true) {
+      throw new locationPolicy.LocationPolicyError(400, 'Verify the selected Home map pin and address before approving.');
+    }
+    if (approvalStatus === 'approved' && homes[0].capture_source === 'map_pin' &&
+        String(body.reviewedAddress ?? '').trim() !== String(homes[0].address ?? '').trim()) {
+      throw new locationPolicy.LocationPolicyError(409, 'The Home address changed. Refresh and verify the new request.');
     }
     if (Number(homes[0].latitude) !== reviewedCoordinates.latitude ||
         Number(homes[0].longitude) !== reviewedCoordinates.longitude) {

@@ -296,6 +296,7 @@ class _DashboardPageState extends State<DashboardPage> {
           <th>Deduction</th>
           <th>Deducted Days</th>
           <th>Updated Salary</th>
+          <th>Earned to Date</th>
           <th>Credited Days</th>
         </tr>
     ''');
@@ -324,6 +325,7 @@ class _DashboardPageState extends State<DashboardPage> {
           <td>${employee.afterLeaves}</td>
           <td>${employee.deductedDays ?? '–'}</td>
           <td>${employee.updatedSalary}</td>
+          <td>${employee.earnedToDate}</td>
           <td>${employee.creditedDays ?? '–'}</td>
         </tr>
       ''');
@@ -1435,6 +1437,7 @@ class _AttendanceTable extends StatelessWidget {
             totalSalaryAfterLeaves: employee.afterLeaves,
             deductedDays: employee.deductedDays,
             updatedSalary: employee.updatedSalary,
+            earnedToDate: employee.earnedToDate,
             creditedDays: employee.creditedDays,
           ),
       ],
@@ -1511,6 +1514,7 @@ class _EmployeeAttendance {
     required this.lopLeaveDays,
     required this.afterLeaves,
     required this.updatedSalary,
+    required this.earnedToDate,
     required this.creditedDays,
     required this.days,
   });
@@ -1533,6 +1537,7 @@ class _EmployeeAttendance {
   final num lopLeaveDays;
   final String afterLeaves;
   final String updatedSalary;
+  final String earnedToDate;
   final num? creditedDays;
   final List<String> days;
 
@@ -1568,6 +1573,7 @@ class _EmployeeAttendance {
       lopLeaveDays: asNum(json['lopLeaveDays']),
       afterLeaves: (json['afterLeaves'] ?? '–').toString(),
       updatedSalary: (json['updatedSalary'] ?? 'Not Set').toString(),
+      earnedToDate: (json['earnedToDate'] ?? '–').toString(),
       creditedDays: creditedDays != null && creditedDays.isFinite && creditedDays >= 0
           ? creditedDays
           : null,
@@ -2292,7 +2298,7 @@ class _MobileYearlySummary extends StatelessWidget {
                     flex: 2,
                     child: Center(
                       child: Text(
-                        employee.updatedSalary,
+                        '${employee.updatedSalary} · Earned: ${employee.earnedToDate}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -2508,12 +2514,12 @@ class _MobileCalendarScroll extends StatelessWidget {
                               SizedBox(
                                 width: summaryWidths[9],
                                 child: Center(
-                                  child: AttendanceDeductionValue(
-                                    amount: employee.updatedSalary,
+                                  child: Column(mainAxisSize: MainAxisSize.min, children: [Text(employee.updatedSalary, style: const TextStyle(fontSize: 10)), AttendanceDeductionValue(
+                                    amount: 'Earned: ${employee.earnedToDate}',
                                     days: employee.creditedDays,
                                     compact: true,
                                     daysSuffix: 'credited',
-                                  ),
+                                  )]),
                                 ),
                               ),
                             ],

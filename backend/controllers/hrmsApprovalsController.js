@@ -34,6 +34,7 @@ function displayType(requestType) {
   if (value === 'late_entry') return 'Late Entry';
   if (value === 'early_exit') return 'Early Exit';
   if (value === 'wfh') return 'Work From Home';
+  if (value === 'permission') return 'Permission';
   return String(requestType || '').replace(/_/g, ' ');
 }
 
@@ -77,6 +78,8 @@ function formatDay(value) {
 
 function leaveDuration(row) {
   if (String(row.duration_type || '').toLowerCase() === 'half day') return 'Half Day';
+  const savedDays = Number(row.leave_days);
+  if (Number.isFinite(savedDays) && savedDays > 0) return `${savedDays} ${savedDays === 1 ? 'Day' : 'Days'}`;
   const from = toIsoDate(row.from_date || row.request_date);
   const to = toIsoDate(row.to_date || row.request_date);
   if (!from || !to) return '1 Day';
@@ -89,7 +92,7 @@ function toUi(row) {
   const actualType = row.el_leave_type || null;
   const type = actualType || displayType(row.request_type);
   const abbreviation = row.lt_abbreviation || null;
-  const start = formatDay(row.request_date || row.el_from_date);
+  const start = formatDay(row.from_date || row.el_from_date || row.request_date);
   const requestType = String(row.request_type).toLowerCase();
   const extra = EXTRA_TYPES.indexOf(requestType) !== -1;
   const leave = LEAVE_TYPES.indexOf(requestType) !== -1;
@@ -98,6 +101,15 @@ function toUi(row) {
   const wfhDays = requestType === 'wfh' && wfhEnd
     ? Math.max(1, Math.round((Date.parse(wfhEnd + 'T00:00:00Z') - Date.parse(start.iso + 'T00:00:00Z')) / 86400000) + 1)
     : 0;
+  const endDate = toIsoDate(row.wfh_end_date || row.to_date) || start.iso;
+  const reason = row.leave_reason != null ? String(row.leave_reason) : String(row.reason || '');
+  let duration = extra ? '—' : requestType === 'wfh' && wfhDays ? `${wfhDays} ${wfhDays === 1 ? 'Day' : 'Days'}` : leaveDuration(row);
+  if (requestType === 'permission') {
+    const minutes = value => { const match = /^(\d{2}):(\d{2})/.exec(String(value || '')); return match ? Number(match[1]) * 60 + Number(match[2]) : null; };
+    const from = minutes(row.permission_start_time), to = minutes(row.permission_end_time);
+    const total = from != null && to != null ? to - from : 0;
+    duration = total > 0 ? [Math.floor(total / 60) ? `${Math.floor(total / 60)}h` : '', total % 60 ? `${total % 60}m` : ''].filter(Boolean).join(' ') : '—';
+  }
   return {
     id: row.id,
     name: String(row.full_name || 'Unknown employee').trim(),
@@ -105,15 +117,16 @@ function toUi(row) {
     type: type,
     abbreviation: abbreviation,
     requestType: row.request_type,
-    dates: requestType === 'wfh' && wfhEnd ? `${start.pretty} – ${formatDay(wfhEnd).pretty}` : (start.pretty || '—'),
+    dates: endDate && endDate !== start.iso ? `${start.pretty} – ${formatDay(endDate).pretty}` : (start.pretty || '—'),
     dayRange: start.weekday && start.weekday !== '—' ? '(' + start.weekday + ')' : '',
-    duration: extra ? '—' : requestType === 'wfh' && wfhDays ? `${wfhDays} ${wfhDays === 1 ? 'Day' : 'Days'}` : leaveDuration(row),
-    reason: row.reason || '',
+    duration,
+    reason: reason.trim(),
     status: String(row.status || 'pending').replace(/^./, function (c) { return c.toUpperCase(); }),
     icon: meta.icon,
     color: meta.color,
     tab: extra ? 'extra' : leave ? 'leave' : 'permission',
-    endDate: toIsoDate(row.wfh_end_date) || null,
+    startDate: start.iso || null,
+    endDate: endDate || null,
     homeLocation: row.home_latitude == null ? null : {
       latitude: Number(row.home_latitude),
       longitude: Number(row.home_longitude),
@@ -155,6 +168,8 @@ async function syncPendingNotifications() {
 async function ensureWfhRequestColumns() {
   const columns = [
     ['wfh_end_date', 'DATE NULL AFTER request_date'],
+    ['permission_start_time', 'TIME NULL AFTER request_date'],
+    ['permission_end_time', 'TIME NULL AFTER permission_start_time'],
     ['home_latitude', 'DECIMAL(10,7) NULL AFTER wfh_end_date'],
     ['home_longitude', 'DECIMAL(10,7) NULL AFTER home_latitude'],
     ['home_accuracy_meters', 'DECIMAL(10,2) NULL AFTER home_longitude'],
@@ -220,6 +235,18 @@ async function list(req, res) {
     const extraPlaceholders = EXTRA_TYPES.map(function () { return '?'; }).join(', ');
     const where = [];
     const params = [];
+    const startDate = String(req.query.startDate || '').trim();
+    const endDate = String(req.query.endDate || '').trim();
+    if (startDate || endDate) {
+      const validDate = value => {
+        const parsed = new Date(value + 'T00:00:00Z');
+        return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+      };
+      if (!validDate(startDate) || !validDate(endDate) || startDate > endDate) return fail(res, 400, 'Valid startDate and endDate are required');
+      // Match the requested day/month against the entire saved request range.
+      where.push('COALESCE(el.from_date, p.request_date) <= ? AND COALESCE(el.to_date, p.wfh_end_date, p.request_date) >= ?');
+      params.push(endDate, startDate);
+    }
 
     if (tab === 'extra') {
       where.push('p.request_type IN (' + extraPlaceholders + ')');
@@ -244,6 +271,7 @@ async function list(req, res) {
 
     const [rows] = await db.query(
       `SELECT p.id, p.employee_id, p.request_type, p.reason, p.status, p.wfh_end_date,
+              p.permission_start_time, p.permission_end_time, el.reason AS leave_reason, el.days_count AS leave_days,
               p.home_latitude, p.home_longitude, p.home_accuracy_meters, p.home_address,
               DATE_FORMAT(p.request_date, '%Y-%m-%d') AS request_date,
               DATE_FORMAT(el.from_date, '%Y-%m-%d') AS from_date,
@@ -260,8 +288,7 @@ async function list(req, res) {
        LEFT JOIN employee_leaves el ON el.id = link.leave_id
        LEFT JOIN hrms_leave_types lt ON lt.id = el.leave_type_id
        WHERE ${where.join(' AND ')}
-       ORDER BY p.created_at DESC
-       LIMIT 200`,
+       ORDER BY p.created_at DESC, p.id DESC`,
       params
     );
 
@@ -352,6 +379,7 @@ async function review(req, res) {
     }
     const [rows] = await db.query(
       `SELECT p.id, p.employee_id, p.request_type, p.reason, p.status, p.wfh_end_date,
+              p.permission_start_time, p.permission_end_time, el.reason AS leave_reason, el.days_count AS leave_days,
               p.home_latitude, p.home_longitude, p.home_accuracy_meters, p.home_address,
               DATE_FORMAT(p.request_date, '%Y-%m-%d') AS request_date,
               DATE_FORMAT(el.from_date, '%Y-%m-%d') AS from_date,

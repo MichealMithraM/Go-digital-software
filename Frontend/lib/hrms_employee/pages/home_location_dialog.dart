@@ -222,6 +222,10 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final position = _position;
+    final capturedPoint = position == null
+        ? null
+        : LatLng(position.latitude, position.longitude);
     final status = _home?['approval_status']?.toString() ?? 'not registered';
     final statusText = switch (status) {
       'approved' => 'Approved',
@@ -287,11 +291,15 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
                             border: OutlineInputBorder(),
                           ),
                         ),
-                        OutlinedButton.icon(
-                          onPressed: _busy ? null : _capture,
-                          icon: const Icon(Icons.my_location),
-                          label: Text(_capturing ? 'Finding location...' : 'Capture Home GPS'),
-                        ),
+                          OutlinedButton.icon(
+                            onPressed: _busy ? null : _capture,
+                            icon: const Icon(Icons.my_location),
+                            label: Text(
+                              _capturing
+                                  ? 'Finding location...'
+                                  : 'Capture Current GPS',
+                            ),
+                          ),
                         const SizedBox(height: 8),
                         OutlinedButton.icon(
                           onPressed: _busy ? null : _selectMap,
@@ -307,15 +315,42 @@ class _HomeLocationDialogState extends State<HomeLocationDialog> {
                             'Admin verification required. This is a map pin, not a GPS reading.',
                           ),
                         ],
-                        if (_position != null) ...[
+                        if (capturedPoint != null) ...[
                           const SizedBox(height: 8),
                           SelectableText(
                             'Captured GPS: '
                             '${_coordinates(_position!.latitude, _position!.longitude)}',
                           ),
                           Text(
-                            'GPS accuracy: '
-                            '${_position!.accuracy.toStringAsFixed(0)} metres',
+                            'Accuracy: ${_position!.accuracy.toStringAsFixed(0)} m'
+                            ' (admin will verify this location)',
+                          ),
+                          const SizedBox(height: 8),
+                          SizedBox(
+                            width: 460,
+                            height: 180,
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: GoogleMap(
+                                key: ValueKey(capturedPoint),
+                                initialCameraPosition: CameraPosition(
+                                  target: capturedPoint,
+                                  zoom: 16,
+                                ),
+                                markers: {
+                                  Marker(
+                                    markerId: const MarkerId('captured-home'),
+                                    position: capturedPoint,
+                                  ),
+                                },
+                                mapToolbarEnabled: false,
+                                zoomControlsEnabled: false,
+                                scrollGesturesEnabled: false,
+                                zoomGesturesEnabled: false,
+                                rotateGesturesEnabled: false,
+                                tiltGesturesEnabled: false,
+                              ),
+                            ),
                           ),
                         ],
                       ],

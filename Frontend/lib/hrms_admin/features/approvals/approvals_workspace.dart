@@ -4,6 +4,7 @@ class _ApprovalsWorkspace extends StatefulWidget {
   const _ApprovalsWorkspace({
     required this.category,
     required this.counts,
+    required this.pendingCount,
     required this.requests,
     required this.employees,
     required this.employee,
@@ -17,6 +18,7 @@ class _ApprovalsWorkspace extends StatefulWidget {
     required this.onStatus,
     required this.onPeriod,
     required this.onReset,
+    required this.onPending,
     required this.onReview,
     required this.corrections,
     required this.selectedDate,
@@ -24,6 +26,7 @@ class _ApprovalsWorkspace extends StatefulWidget {
   });
   final String category, employee, status, period;
   final List<int> counts;
+  final int pendingCount;
   final List<_ApprovalRequest> requests;
   final List<String> employees;
   final bool loading;
@@ -33,7 +36,7 @@ class _ApprovalsWorkspace extends StatefulWidget {
       onEmployee,
       onStatus,
       onPeriod;
-  final VoidCallback onReset;
+  final VoidCallback onReset, onPending;
   final Future<void> Function(_ApprovalRequest, String) onReview;
   final Widget corrections;
   final DateTime selectedDate;
@@ -410,58 +413,65 @@ class _ApprovalsWorkspaceState extends State<_ApprovalsWorkspace> {
       mainAxisSize: MainAxisSize.min,
       children: [
         mode('Day', day, 'Today'),
-        mode('Month', !day, 'This Month'),
-        const SizedBox(width: 12),
-        IconButton.outlined(
-          tooltip: 'Previous date',
-          onPressed: _reviewing ? null : () => move(-1),
-          icon: const Icon(Icons.chevron_left),
-        ),
-        const SizedBox(width: 10),
-        SizedBox(
-          width: 240,
-          height: 44,
-          child: OutlinedButton.icon(
-            onPressed: _reviewing
-                ? null
-                : () async {
-                    final picked = await showDatePicker(
-                      context: context,
-                      initialDate: widget.selectedDate,
-                      firstDate: DateTime(2000),
-                      lastDate: DateTime(2100, 12, 31),
-                    );
-                    if (mounted && picked != null) widget.onDate(picked);
-                  },
-            style: OutlinedButton.styleFrom(
-              foregroundColor: _ApprovalsColors.navy,
-              side: const BorderSide(color: _line),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
+        mode('Month', widget.period == 'This Month', 'This Month'),
+        if (widget.period == 'All')
+          const Padding(
+            padding: EdgeInsets.only(left: 12),
+            child: Text('All dates'),
+          )
+        else ...[
+          const SizedBox(width: 12),
+          IconButton.outlined(
+            tooltip: 'Previous date',
+            onPressed: _reviewing ? null : () => move(-1),
+            icon: const Icon(Icons.chevron_left),
+          ),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 240,
+            height: 44,
+            child: OutlinedButton.icon(
+              onPressed: _reviewing
+                  ? null
+                  : () async {
+                      final picked = await showDatePicker(
+                        context: context,
+                        initialDate: widget.selectedDate,
+                        firstDate: DateTime(2000),
+                        lastDate: DateTime(2100, 12, 31),
+                      );
+                      if (mounted && picked != null) widget.onDate(picked);
+                    },
+              style: OutlinedButton.styleFrom(
+                foregroundColor: _ApprovalsColors.navy,
+                side: const BorderSide(color: _line),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              icon: const Icon(Icons.calendar_month_outlined, size: 20),
+              label: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(child: Text(
+                    DateFormat(
+                      day ? 'dd MMMM yyyy' : 'MMMM yyyy',
+                    ).format(widget.selectedDate),
+                    maxLines: 1, overflow: TextOverflow.ellipsis,
+                  )),
+                  const SizedBox(width: 12),
+                  const Icon(Icons.expand_more, size: 18),
+                ],
               ),
             ),
-            icon: const Icon(Icons.calendar_month_outlined, size: 20),
-            label: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Flexible(child: Text(
-                  DateFormat(
-                    day ? 'dd MMMM yyyy' : 'MMMM yyyy',
-                  ).format(widget.selectedDate),
-                  maxLines: 1, overflow: TextOverflow.ellipsis,
-                )),
-                const SizedBox(width: 12),
-                const Icon(Icons.expand_more, size: 18),
-              ],
-            ),
           ),
-        ),
-        const SizedBox(width: 10),
-        IconButton.outlined(
-          tooltip: 'Next date',
-          onPressed: _reviewing ? null : () => move(1),
-          icon: const Icon(Icons.chevron_right),
-        ),
+          const SizedBox(width: 10),
+          IconButton.outlined(
+            tooltip: 'Next date',
+            onPressed: _reviewing ? null : () => move(1),
+            icon: const Icon(Icons.chevron_right),
+          ),
+        ],
       ],
     );
   }
@@ -541,14 +551,14 @@ class _ApprovalsWorkspaceState extends State<_ApprovalsWorkspace> {
                   ),
                   icon: Icon(entries[i].$3, size: 22),
                   label: Text(
-                    '${entries[i].$2}${widget.counts[i == 2 ? 3 : i] > 0 ? '  (${widget.counts[i == 2 ? 3 : i]})' : ''}',
+                    '${entries[i].$2}${i < widget.counts.length ? '  (${widget.counts[i]})' : ''}',
                   ),
                 ),
             ],
           ),
           const SizedBox(height: 18),
           if (widget.category == 'corrections')
-            Expanded(child: SingleChildScrollView(child: widget.corrections))
+            Expanded(child: widget.corrections)
           else ...[
             Expanded(
               child: Row(
@@ -606,20 +616,17 @@ class _ApprovalsWorkspaceState extends State<_ApprovalsWorkspace> {
                                       ),
                                     ),
                                     const SizedBox(width: 10),
-                                    Expanded(
-                                      flex: 2,
-                                      child: _filter(
-                                        'Status',
-                                        widget.status,
-                                        const [
-                                          'All Status',
-                                          'Pending',
-                                          'Approved',
-                                          'Rejected',
-                                        ],
-                                        widget.onStatus,
-                                        compact: true,
-                                      ),
+                                    _ApprovalStatusButtons(
+                                      status: widget.status,
+                                      pendingCount: widget.pendingCount,
+                                      onChanged: _reviewing ? null : (value) {
+                                        if (value == 'Pending') {
+                                          _search.clear();
+                                          widget.onPending();
+                                        } else {
+                                          widget.onStatus(value);
+                                        }
+                                      },
                                     ),
                                     const SizedBox(width: 8),
                                     SizedBox(
@@ -695,4 +702,36 @@ class _ApprovalsWorkspaceState extends State<_ApprovalsWorkspace> {
       ),
     );
   }
+}
+
+class _ApprovalStatusButtons extends StatelessWidget {
+  const _ApprovalStatusButtons({
+    required this.status,
+    required this.pendingCount,
+    required this.onChanged,
+  });
+
+  final String status;
+  final int pendingCount;
+  final ValueChanged<String>? onChanged;
+
+  @override
+  Widget build(BuildContext context) => Wrap(
+    spacing: 4,
+    runSpacing: 4,
+    children: [
+      for (final value in const ['Approved', 'Pending', 'Rejected'])
+        OutlinedButton(
+          onPressed: onChanged == null ? null : () => onChanged!(value),
+          style: OutlinedButton.styleFrom(
+            backgroundColor: status == value ? _ApprovalsColors.blue : null,
+            foregroundColor: status == value ? Colors.white : _ApprovalsColors.blue,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            minimumSize: const Size(0, 36),
+            textStyle: const TextStyle(fontSize: 12),
+          ),
+          child: Text(value == 'Pending' ? 'Pending ($pendingCount)' : value),
+        ),
+    ],
+  );
 }

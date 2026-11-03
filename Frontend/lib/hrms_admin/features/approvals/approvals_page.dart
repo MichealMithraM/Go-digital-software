@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -41,9 +42,8 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
   String searchQuery = '';
   List<_ApprovalRequest> requests = [];
   List<String> employeeNames = const ['All Employees'];
-  int leaveCount = 0;
-  int extraCount = 0;
-  int permissionCount = 0;
+  List<_ApprovalRequest> _pendingLeaveItems = [];
+  List<_ApprovalRequest> _pendingPermissionItems = [];
   int _pendingLeaveCount = 0;
   int _pendingExtraCount = 0;
   int _pendingPermissionCount = 0;
@@ -54,10 +54,13 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
   String? error;
   int _loadRequest = 0;
   bool _loadedOnce = false;
+  Timer? _refreshTimer;
+  bool _refreshing = false;
 
   // Correction requests
   List<Map<String, dynamic>> _corrections = [];
   bool _correctionsLoading = false;
+  int _correctionsLoadRequest = 0;
   int _correctionsPendingCount = 0;
 
   @override
@@ -65,10 +68,34 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
     super.initState();
     _load();
     _loadCorrections();
+    _refreshTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _refreshRequests(),
+    );
   }
 
-  Future<void> _loadCorrections() async {
-    setState(() => _correctionsLoading = true);
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refreshRequests() async {
+    if (_refreshing || loading || _correctionsLoading || error != null) return;
+    _refreshing = true;
+    try {
+      await Future.wait([
+        _load(background: true),
+        _loadCorrections(background: true),
+      ]);
+    } finally {
+      _refreshing = false;
+    }
+  }
+
+  Future<void> _loadCorrections({bool background = false}) async {
+    final request = ++_correctionsLoadRequest;
+    if (!background) setState(() => _correctionsLoading = true);
     try {
       final token = context.read<AuthService>().token ?? '';
       final response = await http.get(
@@ -76,7 +103,7 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
         headers: {'Authorization': 'Bearer $token'},
       ).timeout(const Duration(seconds: 15));
       final body = jsonDecode(response.body) as Map<String, dynamic>;
-      if (!mounted) return;
+      if (!mounted || request != _correctionsLoadRequest) return;
       if (response.statusCode == 200 && body['success'] == true) {
         final items = (body['data']?['items'] as List? ?? [])
             .whereType<Map>()
@@ -91,7 +118,9 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
         setState(() => _correctionsLoading = false);
       }
     } catch (_) {
-      if (mounted) setState(() => _correctionsLoading = false);
+      if (mounted && request == _correctionsLoadRequest) {
+        setState(() => _correctionsLoading = false);
+      }
     }
   }
 
@@ -120,17 +149,19 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
     }
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool background = false}) async {
     final request = ++_loadRequest;
     final selectedCategory = requestCategory;
     final rangeStart = period == 'Today' ? _selectedDate : DateTime(_selectedDate.year, _selectedDate.month);
     final rangeEnd = period == 'Today' ? _selectedDate : DateTime(_selectedDate.year, _selectedDate.month + 1, 0);
-    final startDate = DateFormat('yyyy-MM-dd').format(rangeStart);
-    final endDate = DateFormat('yyyy-MM-dd').format(rangeEnd);
-    setState(() {
-      loading = true;
-      error = null;
-    });
+    final startDate = period == 'All' ? null : DateFormat('yyyy-MM-dd').format(rangeStart);
+    final endDate = period == 'All' ? null : DateFormat('yyyy-MM-dd').format(rangeEnd);
+    if (!background) {
+      setState(() {
+        loading = true;
+        error = null;
+      });
+    }
     try {
       final results = await Future.wait([
         HrmsApprovalsApi.list(leaveTab: true, employee: employee, status: status, startDate: startDate, endDate: endDate),
@@ -157,9 +188,8 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
       if (!mounted || request != _loadRequest) return;
       setState(() {
         requests = selectedCategory == 'leave' ? leaveItems : selectedCategory == 'extra' ? extraItems : permissionItems;
-        leaveCount = (leave['items'] as List? ?? []).length;
-        extraCount = (extra['items'] as List? ?? []).length;
-        permissionCount = (permissions['items'] as List? ?? []).length;
+        _pendingLeaveItems = _parse(leavePending['items']);
+        _pendingPermissionItems = _parse(permissionPending['items']);
         _pendingLeaveCount = (leavePending['items'] as List? ?? []).length;
         _pendingExtraCount = (extraPending['items'] as List? ?? []).length;
         _pendingPermissionCount = (permissionPending['items'] as List? ?? []).length;
@@ -172,12 +202,21 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
         _loadedOnce = true;
       });
     } catch (err) {
-      if (!mounted || request != _loadRequest) return;
+      if (!mounted || request != _loadRequest || background) return;
       setState(() {
         error = err.toString().replaceFirst('Exception: ', '');
         loading = false;
       });
     }
+  }
+
+  void _openPending() {
+    searchQuery = '';
+    employee = 'All Employees';
+    status = 'Pending';
+    period = 'This Month';
+    requests = [];
+    _load();
   }
 
   List<_ApprovalRequest> _parse(dynamic raw) {
@@ -210,6 +249,14 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
     }
   }
 
+  bool _matchesWorkspaceFilters(_ApprovalRequest request) {
+    final query = searchQuery.trim().toLowerCase();
+    final searchable =
+        '${request.name} ${request.id} ${request.type} ${request.reason}';
+    return searchable.toLowerCase().contains(query) &&
+        _matchesPeriod(request, period, selected: _selectedDate);
+  }
+
   @override
   Widget build(BuildContext context) {
     final mobile = MediaQuery.sizeOf(context).width < 600;
@@ -239,27 +286,36 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
                     : MediaQuery.sizeOf(context).width >= 1000
                         ? _ApprovalsWorkspace(
                             category: _activeTab == 1 ? 'corrections' : requestCategory,
-                            counts: [_pendingLeaveCount, _pendingPermissionCount, _pendingExtraCount, _correctionsPendingCount],
-                            requests: requests.where((r) {
-                              final q = searchQuery.trim().toLowerCase();
-                              return (q.isEmpty || '${r.name} ${r.id} ${r.type} ${r.reason}'.toLowerCase().contains(q)) && _matchesPeriod(r, period, selected: _selectedDate);
-                            }).toList(),
+                            counts: [
+                              _pendingLeaveItems.where(_matchesWorkspaceFilters).length,
+                              _pendingPermissionItems.where(_matchesWorkspaceFilters).length,
+                            ],
+                            pendingCount: requestCategory == 'leave'
+                                ? _pendingLeaveCount
+                                : _pendingPermissionCount,
+                            requests: requests.where(_matchesWorkspaceFilters).toList(),
                             employees: employeeNames, employee: employee, status: status, period: period,
                             loading: loading, error: error,
-                            onCategory: (value) { setState(() { _activeTab = value == 'corrections' ? 1 : 0; if (_activeTab == 0) requestCategory = value; }); if (_activeTab == 1) { _loadCorrections(); } else { _load(); } },
+                            onCategory: (value) { setState(() { _activeTab = value == 'corrections' ? 1 : 0; if (_activeTab == 0 && requestCategory != value) { requestCategory = value; requests = []; } }); if (_activeTab == 1) { _loadCorrections(); } else { _load(); } },
+                            onPending: _openPending,
                             onSearch: (value) => setState(() => searchQuery = value),
                             onEmployee: (value) { employee = value; _load(); },
-                            onStatus: (value) { status = value; _load(); },
+                            onStatus: (value) { status = value; period = 'This Month'; _load(); },
                             onPeriod: (value) { setState(() => period = value); _load(); },
                             selectedDate: _selectedDate,
                             onDate: (value) { setState(() => _selectedDate = value); _load(); },
                             onReset: () { setState(() { searchQuery = ''; employee = 'All Employees'; status = 'All Status'; period = 'Today'; _selectedDate = DateUtils.dateOnly(DateTime.now()); }); _load(); },
                             onReview: _updateStatus,
                             corrections: _CorrectionRequestsPanel(corrections: _corrections.where((c) {
+                              if (period == 'All') return true;
                               final d = DateTime.tryParse('${c['attendance_date']}');
                               if (d == null) return true;
                               return d.year == _selectedDate.year && d.month == _selectedDate.month && (period != 'Today' || d.day == _selectedDate.day);
-                            }).toList(), loading: _correctionsLoading, onApprove: (id) => _reviewCorrection(id, 'approve'), onReject: (id) => _reviewCorrection(id, 'reject')),
+                            }).toList(),
+                              pendingCount: _correctionsPendingCount,
+                              onStatusSelected: () => setState(() => period = 'This Month'),
+                              onPending: _loadCorrections,
+                              loading: _correctionsLoading, onApprove: (id) => _reviewCorrection(id, 'approve'), onReject: (id) => _reviewCorrection(id, 'reject')),
                           )
                         : AdminPageScrollView(
                         padding: EdgeInsets.fromLTRB(
@@ -295,6 +351,9 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
                                 if (_activeTab == 1) ...[
                                   _CorrectionRequestsPanel(
                                     corrections: _corrections,
+                                    pendingCount: _correctionsPendingCount,
+                                    onStatusSelected: () => setState(() => period = 'This Month'),
+                              onPending: _loadCorrections,
                                     loading: _correctionsLoading,
                                     onApprove: (id) => _reviewCorrection(id, 'approve'),
                                     onReject: (id) => _reviewCorrection(id, 'reject'),
@@ -320,8 +379,10 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
                                     return (query.isEmpty || request.name.toLowerCase().contains(query) || request.id.toLowerCase().contains(query) || request.type.toLowerCase().contains(query)) && _matchesPeriod(request, period, selected: _selectedDate);
                                   }).toList(),
                                   searchQuery: searchQuery,
+                                  onPending: _openPending,
                                   onSearch: (value) => setState(() => searchQuery = value),
                                   onTabChanged: (value) {
+                                    if (requestCategory != value) requests = [];
                                     requestCategory = value;
                                     leaveRequests = value == 'leave';
                                     _load();
@@ -332,6 +393,7 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
                                   },
                                   onStatusChanged: (value) {
                                     status = value!;
+                                    period = 'This Month';
                                     _load();
                                   },
                                   onDateChanged: (value) {
@@ -528,6 +590,7 @@ class _RequestsPanel extends StatelessWidget {
     required this.onDateChanged,
     required this.onPeriodChanged,
     required this.onReset,
+    required this.onPending,
     required this.onApprove,
     required this.onReject,
   });
@@ -542,7 +605,7 @@ class _RequestsPanel extends StatelessWidget {
   final ValueChanged<String> onTabChanged;
   final ValueChanged<String?> onEmployeeChanged, onStatusChanged, onDateChanged;
   final ValueChanged<String> onPeriodChanged;
-  final VoidCallback onReset;
+  final VoidCallback onReset, onPending;
   final ValueChanged<_ApprovalRequest> onApprove, onReject;
 
   @override
@@ -582,6 +645,12 @@ class _RequestsPanel extends StatelessWidget {
               onDateChanged: onDateChanged,
               onPeriodChanged: onPeriodChanged,
               onReset: onReset,
+              onPending: onPending,
+              pendingCount: switch (requestCategory) {
+                'leave' => leaveCount,
+                'extra' => extraCount,
+                _ => permissionCount,
+              },
               searchQuery: searchQuery,
               onSearch: onSearch,
             ),
@@ -831,15 +900,30 @@ class _ApprovalFilters extends StatelessWidget {
       required this.onDateChanged,
       required this.onPeriodChanged,
       required this.onReset,
+      required this.onPending,
+      required this.pendingCount,
       required this.searchQuery,
       required this.onSearch});
   final String employee, status, dateRange, period;
   final List<String> employees;
   final ValueChanged<String?> onEmployeeChanged, onStatusChanged, onDateChanged;
   final ValueChanged<String> onPeriodChanged;
-  final VoidCallback onReset;
+  final VoidCallback onReset, onPending;
+  final int pendingCount;
   final String searchQuery;
   final ValueChanged<String> onSearch;
+
+  Widget _statusButtons() => _ApprovalStatusButtons(
+    status: status,
+    pendingCount: pendingCount,
+    onChanged: (value) {
+      if (value == 'Pending') {
+        onPending();
+      } else {
+        onStatusChanged(value);
+      }
+    },
+  );
 
   @override
   Widget build(BuildContext context) =>
@@ -850,10 +934,12 @@ class _ApprovalFilters extends StatelessWidget {
         if (mobile) {
           return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             TextField(
+              key: ValueKey(period),
               onChanged: onSearch,
               decoration: _fieldDecoration(prefix: Icons.search_rounded).copyWith(hintText: 'Search requests', contentPadding: const EdgeInsets.symmetric(vertical: 16)),
             ),
             const SizedBox(height: 10),
+            _statusButtons(),
             Row(children: [
               OutlinedButton.icon(
                 onPressed: () => _showMobileFilters(context),
@@ -875,6 +961,7 @@ class _ApprovalFilters extends StatelessWidget {
                 label: 'Employee',
                 width: width,
                 child: DropdownButtonFormField<String>(
+                    key: ValueKey(employee),
                     initialValue: employee,
                     onChanged: onEmployeeChanged,
                     decoration: _fieldDecoration(),
@@ -894,22 +981,7 @@ class _ApprovalFilters extends StatelessWidget {
                       DropdownMenuItem<String>(
                           value: 'All Dates', child: Text('All Dates')),
                     ])),
-            _FilterField(
-                label: 'Status',
-                width: width,
-                child: DropdownButtonFormField<String>(
-                    initialValue: status,
-                    onChanged: onStatusChanged,
-                    decoration: _fieldDecoration(),
-                    items: const [
-                      'All Status',
-                      'Pending',
-                      'Approved',
-                      'Rejected'
-                    ]
-                        .map((item) =>
-                            DropdownMenuItem(value: item, child: Text(item)))
-                        .toList())),
+            _statusButtons(),
             _FilterField(
                 label: 'Period',
                 width: 280,
@@ -920,8 +992,11 @@ class _ApprovalFilters extends StatelessWidget {
                       ButtonSegment(value: 'Today', label: Text('Today', softWrap: false)),
                       ButtonSegment(value: 'This Month', label: Text('This Month', softWrap: false)),
                     ],
-                    selected: {period},
-                    onSelectionChanged: (value) => onPeriodChanged(value.first),
+                    emptySelectionAllowed: true,
+                    selected: period == 'All' ? const <String>{} : {period},
+                    onSelectionChanged: (value) {
+                      if (value.isNotEmpty) onPeriodChanged(value.first);
+                    },
                     style: ButtonStyle(
                       visualDensity: VisualDensity.compact,
                       padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 10, vertical: 12)),
@@ -956,7 +1031,6 @@ class _ApprovalFilters extends StatelessWidget {
         const SizedBox(height: 16), const Text('Filter requests', style: TextStyle(color: _ApprovalsColors.navy, fontSize: 18, fontWeight: FontWeight.w700)), const SizedBox(height: 16),
         _FilterField(label: 'Employee', width: double.infinity, child: DropdownButtonFormField<String>(initialValue: employee, onChanged: onEmployeeChanged, decoration: _fieldDecoration(), items: employees.map((item) => DropdownMenuItem(value: item, child: Text(item))).toList())),
         const SizedBox(height: 12),
-        _FilterField(label: 'Status', width: double.infinity, child: DropdownButtonFormField<String>(initialValue: status, onChanged: onStatusChanged, decoration: _fieldDecoration(), items: const ['All Status', 'Pending', 'Approved', 'Rejected'].map((item) => DropdownMenuItem(value: item, child: Text(item))).toList())),
         const SizedBox(height: 18),
         FilledButton(onPressed: () => Navigator.pop(sheetContext), child: const Text('Apply filters')),
       ]),
@@ -1440,11 +1514,17 @@ class _CorrectionRequestsPanel extends StatefulWidget {
   const _CorrectionRequestsPanel({
     required this.corrections,
     required this.loading,
+    required this.pendingCount,
+    required this.onPending,
+    this.onStatusSelected,
     required this.onApprove,
     required this.onReject,
   });
   final List<Map<String, dynamic>> corrections;
   final bool loading;
+  final int pendingCount;
+  final VoidCallback onPending;
+  final VoidCallback? onStatusSelected;
   final ValueChanged<int> onApprove, onReject;
 
   @override
@@ -1452,10 +1532,11 @@ class _CorrectionRequestsPanel extends StatefulWidget {
 }
 
 class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
+  final _search = TextEditingController();
   String _searchQuery = '';
   String _statusFilter = 'All Status';
+  Object? _selectedId;
 
-  static const _statuses = ['All Status', 'Pending', 'Approved', 'Rejected'];
 
   List<Map<String, dynamic>> get _filtered {
     return widget.corrections.where((c) {
@@ -1470,7 +1551,37 @@ class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
     }).toList();
   }
 
-  void _resetFilters() => setState(() { _searchQuery = ''; _statusFilter = 'All Status'; });
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  void _resetFilters() {
+    _search.clear();
+    setState(() {
+      _searchQuery = '';
+      _statusFilter = 'All Status';
+    });
+  }
+
+  Widget _statusButtons() => _ApprovalStatusButtons(
+    status: _statusFilter,
+    pendingCount: widget.pendingCount,
+    onChanged: (value) {
+      widget.onStatusSelected?.call();
+      if (value != 'Pending') {
+        setState(() => _statusFilter = value);
+        return;
+      }
+      _search.clear();
+      setState(() {
+        _searchQuery = '';
+        _statusFilter = 'Pending';
+      });
+      widget.onPending();
+    },
+  );
 
   String _fmt(dynamic raw) {
     if (raw == null) return '--';
@@ -1511,6 +1622,7 @@ class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
     if (mobile) {
       return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         TextField(
+          controller: _search,
           onChanged: (v) => setState(() => _searchQuery = v),
           decoration: _fieldDecoration(prefix: Icons.search_rounded).copyWith(
             hintText: 'Search by name or ID',
@@ -1518,16 +1630,9 @@ class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
           ),
         ),
         const SizedBox(height: 10),
-        Row(children: [
-          Expanded(
-            child: DropdownButtonFormField<String>(
-              initialValue: _statusFilter,
-              onChanged: (v) => setState(() => _statusFilter = v ?? 'All Status'),
-              decoration: _fieldDecoration(),
-              items: _statuses.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
-            ),
-          ),
-          const SizedBox(width: 10),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          _statusButtons(),
+          const SizedBox(width: 8),
           IconButton.outlined(
             onPressed: _resetFilters,
             icon: const Icon(Icons.restart_alt_rounded),
@@ -1539,33 +1644,24 @@ class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
       ]);
     }
     return Padding(
-      padding: const EdgeInsets.only(bottom: 16),
+      padding: EdgeInsets.zero,
       child: Wrap(
         spacing: 14,
         runSpacing: 10,
-        crossAxisAlignment: WrapCrossAlignment.end,
+        crossAxisAlignment: WrapCrossAlignment.center,
         children: [
-          _FilterField(
-            label: 'Search',
+          SizedBox(
             width: 260,
             child: TextField(
+              controller: _search,
               onChanged: (v) => setState(() => _searchQuery = v),
               decoration: _fieldDecoration(prefix: Icons.search_rounded).copyWith(
                 hintText: 'Name or employee ID',
-                contentPadding: const EdgeInsets.symmetric(vertical: 15),
+                contentPadding: const EdgeInsets.symmetric(vertical: 8),
               ),
             ),
           ),
-          _FilterField(
-            label: 'Status',
-            width: 200,
-            child: DropdownButtonFormField<String>(
-              initialValue: _statusFilter,
-              onChanged: (v) => setState(() => _statusFilter = v ?? 'All Status'),
-              decoration: _fieldDecoration(),
-              items: _statuses.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
-            ),
-          ),
+          _statusButtons(),
           OutlinedButton.icon(
             onPressed: _resetFilters,
             icon: const Icon(Icons.refresh_rounded),
@@ -1573,7 +1669,7 @@ class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
             style: OutlinedButton.styleFrom(
               foregroundColor: _ApprovalsColors.blue,
               side: const BorderSide(color: Color(0xFFD6DDEA)),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 17),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),
           ),
@@ -1582,10 +1678,223 @@ class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
     );
   }
 
+  Widget _requestCard(Map<String, dynamic> c, {bool fillPane = false}) {
+    final status = c['status']?.toString() ?? 'pending';
+    final isPending = status == 'pending';
+    final statusColor = status == 'approved' ? const Color(0xFF188226) : status == 'rejected' ? const Color(0xFFF0182A) : const Color(0xFFD97706);
+    final statusBg = status == 'approved' ? const Color(0xFFE8F7E9) : status == 'rejected' ? const Color(0xFFFFEAEA) : const Color(0xFFFFF8E6);
+    final name = c['full_name']?.toString() ?? '?';
+    final staffId = c['staff_id']?.toString() ?? '';
+    final initials = name.trim().isEmpty ? '?' : name.trim().substring(0, 1).toUpperCase();
+    final reason = Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(color: const Color(0xFFF7F9FD), borderRadius: BorderRadius.circular(8)),
+          alignment: Alignment.topLeft, child: Text(c['reason']?.toString() ?? '—', style: const TextStyle(fontSize: 13, color: Color(0xFF333B52))),
+        );
+    return Container(
+      margin: fillPane ? EdgeInsets.zero : const EdgeInsets.only(bottom: 12),
+      padding: EdgeInsets.all(fillPane ? 20 : 12),
+      decoration: BoxDecoration(
+        border: fillPane ? null : Border.all(color: const Color(0xFFE5EAF3)),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          CircleAvatar(radius: 20, backgroundColor: const Color(0xFFEAF1FF),
+            child: Text(initials, style: const TextStyle(color: _ApprovalsColors.blue, fontWeight: FontWeight.w700))),
+          const SizedBox(width: 10),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(name, style: const TextStyle(fontWeight: FontWeight.w700, color: _ApprovalsColors.navy)),
+            Text(staffId, style: const TextStyle(fontSize: 11, color: Color(0xFF657087))),
+          ])),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(color: statusBg, borderRadius: BorderRadius.circular(6)),
+            child: Text(_displayStatus(c),
+              style: TextStyle(fontSize: 12, color: statusColor, fontWeight: FontWeight.w600)),
+          ),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Text(_typeLabel(c['request_type']), style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _ApprovalsColors.blue)),
+          const Spacer(),
+          if (c['created_at'] != null)
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.access_time_rounded, size: 13, color: Color(0xFF8A94A6)),
+              const SizedBox(width: 4),
+              Text('Requested ${_fmtDate(c['created_at'])}',
+                style: const TextStyle(fontSize: 11, color: Color(0xFF8A94A6))),
+            ]),
+        ]),
+        if (c['attendance_date'] != null) ...[
+          const SizedBox(height: 4),
+          Row(children: [
+            const Icon(Icons.calendar_today_outlined, size: 13, color: Color(0xFF8A94A6)),
+            const SizedBox(width: 4),
+            Text('Attendance date: ${_fmtDate(c['attendance_date'])}',
+              style: const TextStyle(fontSize: 11, color: Color(0xFF8A94A6))),
+          ]),
+        ],
+        const SizedBox(height: 8),
+        Wrap(spacing: 10, runSpacing: 6, children: [
+          _CorrChip('Check in', _fmt(c['check_in_at'])),
+          _CorrChip('Check out', _fmt(c['check_out_at'])),
+          if (c['requested_check_in_at'] != null) _CorrChip('Requested in', _fmt(c['requested_check_in_at'])),
+          if (c['requested_check_out_at'] != null) _CorrChip('Requested out', _fmt(c['requested_check_out_at'])),
+        ]),
+        const SizedBox(height: 10),
+        const Text('REASON', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Color(0xFF8A94A6), letterSpacing: .06)),
+        const SizedBox(height: 4),
+        reason,
+        if (isPending) ...[
+          const SizedBox(height: 12),
+          Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+            OutlinedButton(
+              onPressed: () => widget.onReject(c['id'] as int),
+              style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFFF0182A),
+                side: const BorderSide(color: Color(0xFFF0182A)),
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                minimumSize: const Size(0, 34),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+              child: const Text('Reject', style: TextStyle(fontSize: 13)),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(
+              onPressed: () => widget.onApprove(c['id'] as int),
+              style: FilledButton.styleFrom(backgroundColor: _ApprovalsColors.blue,
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                minimumSize: const Size(0, 34),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+              child: const Text('Approve correction', style: TextStyle(fontSize: 13)),
+            ),
+          ]),
+        ],
+      ]),
+    );
+  }
+
+  Widget _desktopQueue(List<Map<String, dynamic>> requests) {
+    final selected = requests.where((request) => request['id'] == _selectedId)
+        .firstOrNull ?? requests.firstOrNull;
+
+    Widget panel(Widget child) => Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xFFDDE5F2)),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: child,
+    );
+
+    Widget row(List<Widget> cells, {Color? color, bool? selected}) => Container(
+      color: color,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(children: [
+        SizedBox(
+          width: 28,
+          child: selected == null
+              ? null
+              : Icon(
+                  selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+                  size: 18,
+                  color: selected ? _ApprovalsColors.blue : const Color(0xFFDDE5F2),
+                ),
+        ),
+        for (var i = 0; i < cells.length; i++)
+          Expanded(flex: i < 2 ? 3 : 2, child: cells[i]),
+      ]),
+    );
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          flex: 2,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              panel(Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: _filterBar(context),
+              )),
+              const SizedBox(height: 12),
+              Expanded(
+                child: panel(Column(
+                  children: [
+                    row(
+                      const [
+                        Text('Employee'),
+                        Text('Request Details'),
+                        Text('Attendance Date'),
+                        Text('Status'),
+                      ],
+                      color: const Color(0xFFF4F6FB),
+                    ),
+                    Expanded(
+                      child: requests.isEmpty
+                          ? const Center(child: Text('No requests match the current filters.'))
+                          : ListView.separated(
+                              itemCount: requests.length,
+                              separatorBuilder: (_, _) => const Divider(height: 1),
+                              itemBuilder: (context, index) {
+                                final request = requests[index];
+                                return InkWell(
+                                  onTap: () => setState(() => _selectedId = request['id']),
+                                  child: row(
+                                    [
+                                      Text("${request['full_name'] ?? '—'}\n${request['staff_id'] ?? ''}"),
+                                      Text(_typeLabel(request['request_type'])),
+                                      Text(_fmtDate(request['attendance_date'])),
+                                      _RequestStatus(status: _displayStatus(request)),
+                                    ],
+                                    selected: identical(request, selected),
+                                    color: identical(request, selected)
+                                        ? const Color(0xFFEAF2FF)
+                                        : null,
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                )),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 18),
+        Expanded(
+          child: panel(selected == null
+              ? const Center(child: Text('Select a request to view its details.'))
+              : LayoutBuilder(
+                  builder: (context, constraints) => SingleChildScrollView(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                      child: _requestCard(selected, fillPane: true),
+                    ),
+                  ),
+                )),
+        ),
+      ],
+    );
+  }
+
+  String _displayStatus(Map<String, dynamic> request) {
+    final status = request['status']?.toString() ?? '';
+    return status.isEmpty ? 'Pending' : status[0].toUpperCase() + status.substring(1);
+  }
+
   @override
   Widget build(BuildContext context) {
     if (widget.loading) return const Padding(padding: EdgeInsets.all(32), child: Center(child: CircularProgressIndicator()));
     final filtered = _filtered;
+    if (MediaQuery.sizeOf(context).width >= 1000) {
+      return _desktopQueue(filtered);
+    }
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(color: Colors.white, border: Border.all(color: const Color(0xFFE4E7EE)), borderRadius: BorderRadius.circular(14),
@@ -1606,102 +1915,8 @@ class _CorrectionRequestsPanelState extends State<_CorrectionRequestsPanel> {
               ),
             )
           else
-            ...filtered.map((c) {
-          final status = c['status']?.toString() ?? 'pending';
-          final isPending = status == 'pending';
-          final statusColor = status == 'approved' ? const Color(0xFF188226) : status == 'rejected' ? const Color(0xFFF0182A) : const Color(0xFFD97706);
-          final statusBg = status == 'approved' ? const Color(0xFFE8F7E9) : status == 'rejected' ? const Color(0xFFFFEAEA) : const Color(0xFFFFF8E6);
-          final name = c['full_name']?.toString() ?? '?';
-          final staffId = c['staff_id']?.toString() ?? '';
-          final initials = name.trim().isEmpty ? '?' : name.trim().substring(0, 1).toUpperCase();
-          return Container(
-            margin: const EdgeInsets.only(bottom: 12),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              border: Border.all(color: const Color(0xFFE5EAF3)),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                CircleAvatar(radius: 20, backgroundColor: const Color(0xFFEAF1FF),
-                  child: Text(initials, style: const TextStyle(color: _ApprovalsColors.blue, fontWeight: FontWeight.w700))),
-                const SizedBox(width: 10),
-                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(name, style: const TextStyle(fontWeight: FontWeight.w700, color: _ApprovalsColors.navy)),
-                  Text(staffId, style: const TextStyle(fontSize: 11, color: Color(0xFF657087))),
-                ])),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                  decoration: BoxDecoration(color: statusBg, borderRadius: BorderRadius.circular(6)),
-                  child: Text(status[0].toUpperCase() + status.substring(1),
-                    style: TextStyle(fontSize: 12, color: statusColor, fontWeight: FontWeight.w600)),
-                ),
-              ]),
-              const SizedBox(height: 10),
-              Row(children: [
-                Text(_typeLabel(c['request_type']), style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: _ApprovalsColors.blue)),
-                const Spacer(),
-                if (c['created_at'] != null)
-                  Row(mainAxisSize: MainAxisSize.min, children: [
-                    const Icon(Icons.access_time_rounded, size: 13, color: Color(0xFF8A94A6)),
-                    const SizedBox(width: 4),
-                    Text('Requested ${_fmtDate(c['created_at'])}',
-                      style: const TextStyle(fontSize: 11, color: Color(0xFF8A94A6))),
-                  ]),
-              ]),
-              if (c['attendance_date'] != null) ...[
-                const SizedBox(height: 4),
-                Row(children: [
-                  const Icon(Icons.calendar_today_outlined, size: 13, color: Color(0xFF8A94A6)),
-                  const SizedBox(width: 4),
-                  Text('Attendance date: ${_fmtDate(c['attendance_date'])}',
-                    style: const TextStyle(fontSize: 11, color: Color(0xFF8A94A6))),
-                ]),
-              ],
-              const SizedBox(height: 8),
-              Wrap(spacing: 10, runSpacing: 6, children: [
-                _CorrChip('Check in', _fmt(c['check_in_at'])),
-                _CorrChip('Check out', _fmt(c['check_out_at'])),
-                if (c['requested_check_in_at'] != null) _CorrChip('Requested in', _fmt(c['requested_check_in_at'])),
-                if (c['requested_check_out_at'] != null) _CorrChip('Requested out', _fmt(c['requested_check_out_at'])),
-              ]),
-              const SizedBox(height: 10),
-              const Text('REASON', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Color(0xFF8A94A6), letterSpacing: .06)),
-              const SizedBox(height: 4),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(color: const Color(0xFFF7F9FD), borderRadius: BorderRadius.circular(8)),
-                child: Text(c['reason']?.toString() ?? '—', style: const TextStyle(fontSize: 13, color: Color(0xFF333B52))),
-              ),
-              if (isPending) ...[
-                const SizedBox(height: 12),
-                Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-                  OutlinedButton(
-                    onPressed: () => widget.onReject(c['id'] as int),
-                    style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFFF0182A),
-                      side: const BorderSide(color: Color(0xFFF0182A)),
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 14),
-                      minimumSize: const Size(0, 34),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-                    child: const Text('Reject', style: TextStyle(fontSize: 13)),
-                  ),
-                  const SizedBox(width: 8),
-                  FilledButton(
-                    onPressed: () => widget.onApprove(c['id'] as int),
-                    style: FilledButton.styleFrom(backgroundColor: _ApprovalsColors.blue,
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 14),
-                      minimumSize: const Size(0, 34),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-                    child: const Text('Approve correction', style: TextStyle(fontSize: 13)),
-                  ),
-                ]),
-              ],
-            ]),
-          );
-        }),
+            ...filtered.map(_requestCard),
+
           // footer count
           Padding(
             padding: const EdgeInsets.only(top: 8),

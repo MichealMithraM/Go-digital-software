@@ -22,8 +22,6 @@ class EmployeeTrackingPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final arguments = ModalRoute.of(context)?.settings.arguments;
     final routeHistory = arguments == 'history';
-    final clockInAfterTracking =
-        arguments is Map && arguments['clockInAfterTracking'] == true;
     return EmployeeScaffold(
       route: '/employee/tracking',
       title: routeHistory ? 'Route History' : 'Live Tracking',
@@ -54,12 +52,10 @@ class EmployeeTrackingPage extends StatelessWidget {
       desktop: _TrackingView(
         mobile: false,
         routeHistory: routeHistory,
-        clockInAfterTracking: clockInAfterTracking,
       ),
       mobile: _TrackingView(
         mobile: true,
         routeHistory: routeHistory,
-        clockInAfterTracking: clockInAfterTracking,
       ),
     );
   }
@@ -119,11 +115,9 @@ class _TrackingView extends StatefulWidget {
   const _TrackingView({
     required this.mobile,
     required this.routeHistory,
-    required this.clockInAfterTracking,
   });
   final bool mobile;
   final bool routeHistory;
-  final bool clockInAfterTracking;
 
   @override
   State<_TrackingView> createState() => _TrackingViewState();
@@ -134,7 +128,6 @@ class _TrackingViewState extends State<_TrackingView> {
   String updated = 'Not tracking yet';
   bool trackingActive = false;
   bool _isHybridEmployee = false;
-  bool _clockInPromptShown = false;
   Timer? _locationTimer;
   Timer? _radiusHeartbeatTimer;
   Position? _lastPosition;
@@ -397,12 +390,6 @@ class _TrackingViewState extends State<_TrackingView> {
 
       if (active) {
         _startLocationTimer();
-        if (widget.clockInAfterTracking && !_clockInPromptShown && mounted) {
-          _clockInPromptShown = true;
-          WidgetsBinding.instance.addPostFrameCallback(
-            (_) => _showClockInPrompt(),
-          );
-        }
       }
     } catch (_) {
       // Office and Home employees do not receive a Hybrid tracking session.
@@ -600,52 +587,6 @@ class _TrackingViewState extends State<_TrackingView> {
       Navigator.of(
         context,
       ).pushNamedAndRemoveUntil('/employee/dashboard', (route) => false);
-    }
-  }
-
-  Future<void> _showClockInPrompt() async {
-    if (!mounted || !trackingActive) return;
-    final shouldClockIn = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Live tracking started'),
-        content: const Text(
-          'Your current location is being tracked. You can now check in from this location.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Later'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Check In now'),
-          ),
-        ],
-      ),
-    );
-    if (shouldClockIn == true) await _clockInAfterTracking();
-  }
-
-  Future<void> _clockInAfterTracking() async {
-    try {
-      final position = await _getCurrentPosition();
-      await AttendanceApi.checkIn(
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        capturedAt: position.timestamp,
-      );
-      if (!mounted) return;
-      Navigator.pop(context, true);
-    } catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(error.toString().replaceFirst('Exception: ', '')),
-        ),
-      );
     }
   }
 

@@ -1392,3 +1392,28 @@ class _MobileEmployeeHeaderState extends State<MobileEmployeeHeader> {
     );
   }
 }
+
+Future<void> offerHybridFieldTracking(BuildContext context) async {
+  final openTracking = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('Start field tracking?'),
+      content: const Text(
+        'You are checked in. Open Tracking to start live tracking for field work.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text('Not now'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text('Open Tracking'),
+        ),
+      ],
+    ),
+  );
+  if (openTracking == true && context.mounted) {
+    await Navigator.pushNamed<void>(context, '/employee/tracking');
+  }
+}

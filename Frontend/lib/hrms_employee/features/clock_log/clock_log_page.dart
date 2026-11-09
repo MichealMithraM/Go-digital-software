@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:godigital_portal/services/authenticated_http.dart' as http;
 import 'package:intl/intl.dart';
@@ -38,6 +39,7 @@ class _ClockViewState extends State<_ClockView> {
   bool _actionLoading = false;
 
   bool _isCheckedIn = false;
+  String? _workMode;
   String? _clockInTimeStr;
   String? _clockOutTimeStr;
   int _elapsedSeconds = 0;
@@ -164,6 +166,7 @@ class _ClockViewState extends State<_ClockView> {
           if (mounted) {
             setState(() {
               _isCheckedIn = isCheckedIn;
+              _workMode = session?['work_mode']?.toString();
               _clockInTimeStr = inFormatted;
               _clockOutTimeStr = outFormatted;
               _elapsedSeconds = elapsed;
@@ -186,37 +189,15 @@ class _ClockViewState extends State<_ClockView> {
     final token = _getToken();
     if (_actionLoading) return;
     if (token == null || token.isEmpty) return;
-    if (!_isCheckedIn) {
-      try {
-        final policyResponse = await http.get(
-          Uri.parse(
-            '${ApiConfig.baseUrl}/attendance/check-in-policy?_=${DateTime.now().microsecondsSinceEpoch}',
-          ),
-          headers: {
-            'Accept': 'application/json',
-            'Authorization': 'Bearer $token',
-          },
-        ).timeout(const Duration(seconds: 15));
-        final policyBody = jsonDecode(policyResponse.body);
-        final policy = policyBody is Map ? policyBody['data'] : null;
-        if (policyResponse.statusCode == 200 &&
-            policyBody is Map &&
-            policyBody['success'] == true &&
-            policy is Map &&
-            policy['workMode'] == 'Hybrid') {
-          if (!mounted || token != _getToken()) return;
-          final clockedIn = await Navigator.pushNamed<bool>(
-            context,
-            '/employee/tracking',
-            arguments: const {'clockInAfterTracking': true},
-          );
-          if (clockedIn == true && mounted) await _fetchTodayStatus();
-          return;
-        }
-      } catch (_) {
-        // The normal Clock In request below will show the backend's message.
-      }
+    if (kIsWeb) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Check In / Check Out is only available on the mobile app.'),
+        ),
+      );
+      return;
     }
+    final clockOut = _isCheckedIn;
     setState(() => _actionLoading = true);
     final endpoint = _isCheckedIn ? '/attendance/clock-out' : '/attendance/clock-in';
     final client = http.Client();
@@ -253,6 +234,10 @@ class _ClockViewState extends State<_ClockView> {
       }
       if (!mounted || token != _getToken()) return;
       await _fetchTodayStatus();
+      if (mounted && token == _getToken() && !clockOut &&
+          _isCheckedIn && _workMode == 'Hybrid') {
+        await offerHybridFieldTracking(context);
+      }
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(

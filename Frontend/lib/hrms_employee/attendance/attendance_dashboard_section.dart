@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:godigital_portal/services/authenticated_http.dart' as http;
 import 'package:intl/intl.dart';
@@ -10,6 +11,7 @@ import '../../services/api_config.dart';
 import '../../services/attendance_location.dart';
 import '../../services/auth_service.dart';
 import '../../services/auth_storage.dart';
+import '../../services/hrms_attendance_tracker.dart';
 import '../shared/employee_ui.dart';
 
 /// Attendance on the employee home screen. Other modules retain their own state.
@@ -297,6 +299,15 @@ class _AttendanceDashboardSectionState extends State<AttendanceDashboardSection>
   }
 
   Future<void> _punch() async {
+    if (kIsWeb) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Check In / Check Out is only available on the mobile app.'),
+          duration: Duration(seconds: 4),
+        ),
+      );
+      return;
+    }
     final token = _token;
     if (token == null || _loading || _punching || _error != null) return;
     final clockOut = _data?['status'] == 'checked_in';
@@ -313,6 +324,7 @@ class _AttendanceDashboardSectionState extends State<AttendanceDashboardSection>
     }
     setState(() => _punching = true);
     String message;
+    bool punchSucceeded = false;
     try {
       Map<String, dynamic> payload;
       if (clockOut) {
@@ -342,6 +354,7 @@ class _AttendanceDashboardSectionState extends State<AttendanceDashboardSection>
       message = clockOut
           ? 'You have been checked out.'
           : 'You are now checked in.';
+      punchSucceeded = true;
     } catch (error) {
       message = '${_message(error)} Refresh attendance before trying again.';
     }
@@ -349,10 +362,21 @@ class _AttendanceDashboardSectionState extends State<AttendanceDashboardSection>
     if (!mounted || token != _token) return;
     await _load();
     if (!mounted || token != _token) return;
+    if (punchSucceeded) {
+      if (clockOut) {
+        unawaited(HrmsAttendanceTracker.instance.stopTracking());
+      } else {
+        unawaited(HrmsAttendanceTracker.instance.startTracking());
+      }
+    }
     setState(() => _punching = false);
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
+    if (punchSucceeded && !clockOut &&
+        (_data?['session'] as Map?)?['work_mode'] == 'Hybrid') {
+      await offerHybridFieldTracking(context);
+    }
   }
 
   Future<void> _toggleBreak() async {

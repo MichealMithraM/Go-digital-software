@@ -6,6 +6,7 @@ import 'package:hrms_design_system/hrms_design_system.dart';
 import 'package:hrms_responsive/hrms_responsive.dart';
 import '../../services/attendance_api.dart';
 import '../../services/attendance_location.dart';
+import '../../services/hrms_attendance_tracker.dart';
 import '../../services/hrms_tracking_api.dart';
 import 'employee_nav.dart';
 
@@ -38,7 +39,10 @@ class _EmployeeShellState extends State<EmployeeShell> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _startLocationGuard());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _startLocationGuard();
+      HrmsAttendanceTracker.instance.resumeIfActive();
+    });
   }
 
   @override

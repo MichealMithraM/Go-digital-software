@@ -120,15 +120,17 @@ class AttendanceLocation {
     required http.Client client,
     required String token,
     Future<Position> Function()? locate,
+    bool forceLocation = false,
   }) async {
     final policy = await checkInPolicy(client: client, token: token);
-    if (policy['workMode'] == 'Hybrid') {
+    if (policy['workMode'] == 'Hybrid' && !forceLocation) {
       // Hybrid employees may Clock In from any location. The backend records
       // the work mode and the Tracking endpoint later requires this Clock In.
       return <String, dynamic>{};
     }
-    if (policy['requiresLocation'] != true ||
-        !['Office', 'Home'].contains(policy['workMode'])) {
+    if (!forceLocation &&
+        (policy['requiresLocation'] != true ||
+            !['Office', 'Home'].contains(policy['workMode']))) {
       throw const AttendanceLocationError(
         'Check In rules are unavailable. Contact your admin.',
       );

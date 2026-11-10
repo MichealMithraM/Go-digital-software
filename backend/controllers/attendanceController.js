@@ -6,6 +6,7 @@ const locationPolicy = require('../lib/attendanceLocationPolicy');
 const payroll = require('./hrmsPayrollController');
 const { isWorkingDay } = require('../jobs/auto-absence');
 const { effectiveOverrides } = require('../lib/calendarOverrides');
+const crypto = require('crypto');
 
 function ok(res, data, message) {
   message = message || 'OK';
@@ -14,6 +15,101 @@ function ok(res, data, message) {
 
 function fail(res, status, message) {
   return res.status(status).json({ success: false, message: message });
+}
+
+// Attendance must never depend on a client-side hidden button.  The API is
+// the enforcement point: native clients remain supported, while web punches
+// are limited to an administrator-approved iPhone browser until the iOS app
+// is released.  Device IDs are opaque random browser-installation IDs, never
+// hardware IDs or IP addresses.
+async function ensureAttendanceWebAccessTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS hrms_attendance_ios_web_devices (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    employee_id BIGINT UNSIGNED NOT NULL,
+    device_id_hash CHAR(64) NOT NULL,
+    status ENUM('pending','approved','revoked') NOT NULL DEFAULT 'pending',
+    user_agent VARCHAR(512) NULL,
+    approved_by BIGINT UNSIGNED NULL,
+    approved_at DATETIME NULL,
+    revoked_at DATETIME NULL,
+    last_used_at DATETIME NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_attendance_ios_web_device (employee_id, device_id_hash),
+    KEY idx_attendance_ios_web_status (status, employee_id)
+  )`);
+}
+
+function deviceHash(deviceId) {
+  return crypto.createHash('sha256').update(String(deviceId)).digest('hex');
+}
+
+function isIosBrowser(req) {
+  const ua = String(req.get('user-agent') || '');
+  // iPadOS desktop-mode Safari identifies as Macintosh but includes Mobile.
+  return /iPhone|iPod|iPad/i.test(ua) || (/Macintosh/i.test(ua) && /Mobile\//i.test(ua));
+}
+
+async function attendanceAccess(req, employeeId, options) {
+  const client = String(req.get('x-attendance-client') || '').toLowerCase();
+  if (client === 'android-app' || client === 'ios-app') return { channel: client };
+
+  // Compatibility for the already-distributed Android APK. Browser requests
+  // identify as Mozilla-based clients; native Flutter HTTP requests do not.
+  // New APK builds send the explicit header above.
+  if (!client && !/Mozilla\//i.test(String(req.get('user-agent') || ''))) {
+    return { channel: 'legacy-native-app' };
+  }
+
+  if (client !== 'ios-web' || !isIosBrowser(req)) {
+    throw new locationPolicy.LocationPolicyError(
+      403,
+      'Check In / Check Out is available only in the Android app or an approved iPhone browser.'
+    );
+  }
+
+  const deviceId = String(req.get('x-attendance-device-id') || '');
+  if (!/^[A-Za-z0-9_-]{32,160}$/.test(deviceId)) {
+    throw new locationPolicy.LocationPolicyError(403, 'This iPhone browser is not registered for attendance.');
+  }
+  await ensureAttendanceWebAccessTable();
+  const [rows] = await db.query(
+    `SELECT id, status FROM hrms_attendance_ios_web_devices
+     WHERE employee_id = ? AND device_id_hash = ? LIMIT 1`,
+    [employeeId, deviceHash(deviceId)]
+  );
+  const device = rows[0];
+  if (!device || device.status !== 'approved') {
+    throw new locationPolicy.LocationPolicyError(
+      403,
+      device && device.status === 'pending'
+        ? 'Your iPhone attendance access is waiting for admin approval.'
+        : 'This iPhone browser is not approved for attendance.'
+    );
+  }
+  if (options && options.requireLocation) {
+    const body = req.body || {};
+    const latitude = Number(body.latitude);
+    const longitude = Number(body.longitude);
+    const accuracy = Number(body.accuracy);
+    const capturedAt = new Date(body.capturedAt);
+    const age = Date.now() - capturedAt.getTime();
+    if (!Number.isFinite(latitude) || Math.abs(latitude) > 90 ||
+        !Number.isFinite(longitude) || Math.abs(longitude) > 180 ||
+        !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 100 ||
+        Number.isNaN(capturedAt.getTime()) || age < -30000 || age > 120000) {
+      throw new locationPolicy.LocationPolicyError(
+        400,
+        'A fresh, accurate iPhone location is required for attendance.'
+      );
+    }
+  }
+  await db.query(
+    `UPDATE hrms_attendance_ios_web_devices
+     SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [device.id]
+  );
+  return { channel: 'ios-web', deviceId: device.id };
 }
 
 function parseDateParam(value) {
@@ -104,6 +200,13 @@ function normalizeMethod(value) {
   if (method === 'wifi' || method === 'office_wifi') return 'wifi';
   if (method === 'manual') return 'manual';
   return 'mobile';
+}
+
+function attendanceMethodForChannel(channel, requestedMethod) {
+  // The server owns this label.  A web client cannot choose its own platform
+  // label; it has already been authorised as Android/native or approved iOS.
+  if (normalizeMethod(requestedMethod) === 'manual') return 'manual';
+  return channel === 'ios-web' ? 'ios_mobile' : 'android_mobile';
 }
 
 function requireAdmin(req, res, next) {
@@ -1004,6 +1107,93 @@ async function checkInPolicy(req, res) {
   }
 }
 
+async function registerIosWebDevice(req, res) {
+  try {
+    if (!req.user || !req.user.id) return fail(res, 401, 'Unauthorized');
+    if (String(req.get('x-attendance-client') || '').toLowerCase() !== 'ios-web' || !isIosBrowser(req)) {
+      return fail(res, 403, 'iPhone Safari is required to register web attendance access.');
+    }
+    const deviceId = String(req.get('x-attendance-device-id') || '');
+    if (!/^[A-Za-z0-9_-]{32,160}$/.test(deviceId)) {
+      return fail(res, 400, 'Invalid iPhone browser registration. Please retry from Safari.');
+    }
+    await ensureAttendanceWebAccessTable();
+    const hash = deviceHash(deviceId);
+    const [existing] = await db.query(
+      `SELECT id, status FROM hrms_attendance_ios_web_devices
+       WHERE employee_id = ? AND device_id_hash = ? LIMIT 1`,
+      [req.user.id, hash]
+    );
+    let status = 'pending';
+    if (existing[0]) {
+      status = existing[0].status;
+      if (status !== 'revoked') {
+        await db.query(
+          `UPDATE hrms_attendance_ios_web_devices
+           SET user_agent = ?, last_used_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          [String(req.get('user-agent') || '').slice(0, 512), existing[0].id]
+        );
+      }
+    } else {
+      await db.query(
+        `INSERT INTO hrms_attendance_ios_web_devices
+         (employee_id, device_id_hash, user_agent, status)
+         VALUES (?, ?, ?, 'pending')`,
+        [req.user.id, hash, String(req.get('user-agent') || '').slice(0, 512)]
+      );
+    }
+    return ok(res, { status }, status === 'approved'
+      ? 'This iPhone is approved for attendance.'
+      : status === 'revoked'
+        ? 'This iPhone access has been revoked. Contact your admin.'
+        : 'Your iPhone is registered and waiting for admin approval.');
+  } catch (error) {
+    console.error('POST /attendance/ios-web-devices/register', error);
+    return fail(res, 500, 'Unable to register this iPhone. Please try again.');
+  }
+}
+
+async function listIosWebDevices(req, res) {
+  try {
+    await ensureAttendanceWebAccessTable();
+    const [rows] = await db.query(
+      `SELECT d.id, d.employee_id, d.status, d.created_at, d.approved_at,
+              d.revoked_at, d.last_used_at, p.full_name, p.employee_code
+       FROM hrms_attendance_ios_web_devices d
+       LEFT JOIN hrms_employee_profiles p ON p.employee_user_id = d.employee_id
+       ORDER BY FIELD(d.status, 'pending', 'approved', 'revoked'), d.created_at DESC`
+    );
+    return ok(res, { items: rows });
+  } catch (error) {
+    console.error('GET /attendance/ios-web-devices', error);
+    return fail(res, 500, 'Unable to load iPhone attendance devices.');
+  }
+}
+
+async function updateIosWebDevice(req, res) {
+  try {
+    await ensureAttendanceWebAccessTable();
+    const id = Number(req.params.id);
+    const status = String(req.body && req.body.status || '').toLowerCase();
+    if (!Number.isSafeInteger(id) || !['approved', 'revoked'].includes(status)) {
+      return fail(res, 400, 'Choose approved or revoked status.');
+    }
+    const [result] = await db.query(
+      `UPDATE hrms_attendance_ios_web_devices
+       SET status = ?, approved_by = CASE WHEN ? = 'approved' THEN ? ELSE approved_by END,
+           approved_at = CASE WHEN ? = 'approved' THEN CURRENT_TIMESTAMP ELSE approved_at END,
+           revoked_at = CASE WHEN ? = 'revoked' THEN CURRENT_TIMESTAMP ELSE NULL END
+       WHERE id = ?`,
+      [status, status, req.user.id, status, status, id]
+    );
+    if (!result.affectedRows) return fail(res, 404, 'iPhone registration not found.');
+    return ok(res, null, status === 'approved' ? 'iPhone web attendance approved.' : 'iPhone web attendance revoked.');
+  } catch (error) {
+    console.error('PATCH /attendance/ios-web-devices/:id', error);
+    return fail(res, 500, 'Unable to update iPhone attendance access.');
+  }
+}
+
 async function checkIn(req, res) {
   let connection;
   try {
@@ -1011,9 +1201,13 @@ async function checkIn(req, res) {
     await ensureAttendanceSafetyTables();
     if (!req.user || !req.user.id) return fail(res, 401, 'Unauthorized');
     const employeeId = req.user.id;
+    const access = await attendanceAccess(req, employeeId, { requireLocation: true });
     const date = policy.todayIstDate();
     const at = policy.nowIstDateTime();
-    const method = normalizeMethod((req.body && (req.body.method || req.body.check_in_method)));
+    const method = attendanceMethodForChannel(
+      access.channel,
+      req.body && (req.body.method || req.body.check_in_method)
+    );
     const late = policy.displayStatus({checkInAt: at, attendanceDate: date}, attendanceRules) === 'Late';
     const absent = policy.isAbsentCheckIn(at);
     connection = await db.getConnection();
@@ -1086,6 +1280,7 @@ async function checkOut(req, res) {
     const rules = await policy.getTimeSettings(db);
     await ensureAttendanceSafetyTables();
     const employeeId = req.user.id;
+    await attendanceAccess(req, employeeId, { requireLocation: true });
     const date = policy.todayIstDate();
     const at = policy.nowIstDateTime();
     const record = await getRecord(employeeId, date);
@@ -1727,6 +1922,9 @@ module.exports = {
   myHistory: myHistory,
   dayDetail: dayDetail,
   checkInPolicy: checkInPolicy,
+  registerIosWebDevice: registerIosWebDevice,
+  listIosWebDevices: listIosWebDevices,
+  updateIosWebDevice: updateIosWebDevice,
   checkIn: checkIn,
   checkOut: checkOut,
   startBreak: startBreak,

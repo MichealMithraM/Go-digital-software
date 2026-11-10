@@ -6,6 +6,40 @@ import 'api_config.dart';
 import 'auth_storage.dart';
 
 abstract final class HrmsClockLogsApi {
+  static Future<List<Map<String, dynamic>>> iosWebDevices() async {
+    final token = await AuthStorage.getString('auth_token');
+    final response = await http.get(
+      Uri.parse('${ApiConfig.baseUrl}/attendance/ios-web-devices'),
+      headers: {if (token != null && token.isNotEmpty) 'Authorization': 'Bearer $token'},
+    );
+    final decoded = response.body.isEmpty ? <String, dynamic>{} : jsonDecode(response.body);
+    final map = decoded is Map ? Map<String, dynamic>.from(decoded) : <String, dynamic>{};
+    if (response.statusCode >= 400 || map['success'] == false) {
+      throw Exception(map['message']?.toString() ?? 'Could not load iPhone access requests');
+    }
+    return ((map['data'] as Map?)?['items'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+  }
+
+  static Future<void> updateIosWebDevice(int id, String status) async {
+    final token = await AuthStorage.getString('auth_token');
+    final response = await http.patch(
+      Uri.parse('${ApiConfig.baseUrl}/attendance/ios-web-devices/$id'),
+      headers: {
+        'Content-Type': 'application/json',
+        if (token != null && token.isNotEmpty) 'Authorization': 'Bearer $token',
+      },
+      body: jsonEncode({'status': status}),
+    );
+    final decoded = response.body.isEmpty ? <String, dynamic>{} : jsonDecode(response.body);
+    final map = decoded is Map ? Map<String, dynamic>.from(decoded) : <String, dynamic>{};
+    if (response.statusCode >= 400 || map['success'] == false) {
+      throw Exception(map['message']?.toString() ?? 'Could not update iPhone access');
+    }
+  }
+
   static Future<Map<String, dynamic>> calendar({
     required int employeeId,
     required DateTime month,

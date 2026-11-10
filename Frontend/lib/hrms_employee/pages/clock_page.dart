@@ -1,14 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:godigital_portal/services/authenticated_http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
 import '../../services/api_config.dart';
+import '../../services/attendance_client_identity.dart';
 import '../../services/attendance_location.dart';
 import '../../services/auth_service.dart';
+import '../../services/hrms_attendance_tracker.dart';
 import '../../services/hrms_tracking_api.dart';
 import '../shared/employee_ui.dart';
 
@@ -99,6 +102,7 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
       'Authorization': 'Bearer $token',
       'Accept': 'application/json',
       'Content-Type': 'application/json',
+      if (post) ...await AttendanceClientIdentity.headers(),
     };
     final response =
         await (post
@@ -171,40 +175,20 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
   }
 
   Future<void> _punch() async {
-    final token = _token;
-    if (token == null || _loading || _punching || _error != null) return;
-    final clockOut = _data?['status'] == 'checked_in';
-
-    // ── Hybrid check-in: redirect to tracking page ────────────────────────────
-    if (!clockOut) {
-      try {
-        final policy = await _call('check-in-policy', token);
-        if (policy['workMode'] == 'Hybrid') {
-          if (!mounted || token != _token) return;
-          final clockedIn = await Navigator.pushNamed<bool>(
-            context,
-            '/employee/tracking',
-            arguments: const {'clockInAfterTracking': true},
-          );
-          if (!mounted || token != _token) return;
-          await _load();
-          if (clockedIn == true && mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('You are now checked in.')),
-            );
-            // After Hybrid check-in succeeds, offer to start field tracking
-            await _offerStartTracking();
-          }
-          return;
-        }
-      } catch (error) {
-        if (!mounted || token != _token) return;
+    if (kIsWeb) {
+      if (!await AttendanceClientIdentity.isIosWeb) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(_message(error))),
+          const SnackBar(
+            content: Text('Check In / Check Out is available only in the Android app or an approved iPhone browser.'),
+            duration: Duration(seconds: 4),
+          ),
         );
         return;
       }
     }
+    final token = _token;
+    if (token == null || _loading || _punching || _error != null) return;
+    final clockOut = _data?['status'] == 'checked_in';
 
     // ── Hybrid checkout: warn if field tracking is still active ───────────────
     if (clockOut) {
@@ -230,6 +214,7 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
 
     setState(() => _punching = true);
     String message;
+    bool punchSucceeded = false;
     try {
       Map<String, dynamic> payload;
       if (clockOut) {
@@ -239,14 +224,17 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
             'latitude': pos.latitude,
             'longitude': pos.longitude,
             'accuracy': pos.accuracy,
+            'capturedAt': pos.timestamp.toUtc().toIso8601String(),
           };
         } catch (_) {
+          if (kIsWeb) rethrow;
           payload = <String, dynamic>{};
         }
       } else {
         payload = await AttendanceLocation.checkInPayload(
           client: _client,
           token: token,
+          forceLocation: kIsWeb,
         );
       }
       if (!mounted || token != _token) return;
@@ -259,6 +247,7 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
       message = clockOut
           ? 'You have been checked out.'
           : 'You are now checked in.';
+      punchSucceeded = true;
     } catch (error) {
       message = '${_message(error)} Refresh attendance before trying again.';
     }
@@ -266,28 +255,20 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
     if (!mounted || token != _token) return;
     await _load();
     if (!mounted || token != _token) return;
+    if (punchSucceeded) {
+      if (clockOut) {
+        unawaited(HrmsAttendanceTracker.instance.stopTracking());
+      } else {
+        unawaited(HrmsAttendanceTracker.instance.startTracking());
+      }
+    }
     setState(() => _punching = false);
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
-  }
-
-  // Show "Start Field Tracking?" popup after Hybrid check-in
-  Future<void> _offerStartTracking() async {
-    if (!mounted) return;
-    final start = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Start Field Tracking?'),
-        content: const Text('You are checked in. Start tracking if you are heading out for field work.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Not Now')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Start Tracking')),
-        ],
-      ),
-    );
-    if (start == true && mounted) {
-      await Navigator.pushNamed(context, '/employee/tracking');
+    if (punchSucceeded && !clockOut &&
+        (_data?['session'] as Map?)?['work_mode'] == 'Hybrid') {
+      await offerHybridFieldTracking(context);
     }
   }
 

@@ -778,6 +778,20 @@ async function routeHistory(req, res) {
       [employeeUserId, date]
     );
 
+    // Waiting reasons are employee-submitted events.  Return them with the
+    // route so the dashboard can place the same event on both the map and the
+    // existing route progress line without making a second, unscoped request.
+    const [waitingReasons] = await db.query(
+      `SELECT id, latitude, longitude, reason, reason_submitted_at,
+              waiting_detected_at, review_status, reviewed_at
+       FROM hrms_field_waiting_reasons
+       WHERE employee_user_id = ?
+         AND reason IS NOT NULL
+         AND DATE(reason_submitted_at) = ?
+       ORDER BY reason_submitted_at ASC`,
+      [employeeUserId, date]
+    );
+
     const activities = pings.map(function (row) {
       return {
         latitude: Number(row.latitude),
@@ -811,6 +825,18 @@ async function routeHistory(req, res) {
       points: activities,
       activities: activities,
       routePoints: routePoints,
+      waitingReasons: waitingReasons.map(function (row) {
+        return {
+          id: Number(row.id),
+          latitude: nullableNumber(row.latitude),
+          longitude: nullableNumber(row.longitude),
+          reason: row.reason,
+          submittedAt: row.reason_submitted_at,
+          detectedAt: row.waiting_detected_at,
+          reviewStatus: row.review_status || 'pending',
+          reviewedAt: row.reviewed_at,
+        };
+      }),
       distanceMeters: totalDistance,
       durationSeconds: totalDuration,
       averageSpeedKmh: totalDuration > 0

@@ -1118,6 +1118,7 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
   Map<String, dynamic>? data;
   GoogleMapController? controller;
   int _request = 0;
+  int? _selectedWaitingReasonId;
 
   @override
   void initState() {
@@ -1146,6 +1147,7 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
     setState(() {
       loading = true;
       error = null;
+      _selectedWaitingReasonId = null;
     });
     final id = widget.employee.employeeUserId;
     if (id == null) {
@@ -1173,6 +1175,28 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
     }
   }
 
+  Future<void> _selectWaitingReason(Map reason) async {
+    final latitude = (reason['latitude'] as num?)?.toDouble();
+    final longitude = (reason['longitude'] as num?)?.toDouble();
+    if (!mounted) return;
+    setState(
+      () => _selectedWaitingReasonId = (reason['id'] as num?)?.toInt(),
+    );
+    if (latitude != null && longitude != null) {
+      await controller?.animateCamera(
+        CameraUpdate.newLatLngZoom(LatLng(latitude, longitude), 16),
+      );
+    }
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => _WaitingReasonDetailsDialog(
+        employeeName: widget.employee.name,
+        reason: reason,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final points = (data?['routePoints'] as List? ?? [])
@@ -1185,6 +1209,9 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
         )
         .toList();
     final activities = (data?['activities'] as List? ?? [])
+        .whereType<Map>()
+        .toList();
+    final waitingReasons = (data?['waitingReasons'] as List? ?? [])
         .whereType<Map>()
         .toList();
     final durationSeconds = (data?['durationSeconds'] as num?)?.toInt() ?? 0;
@@ -1360,6 +1387,27 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
                                           title: widget.employee.name,
                                         ),
                                       ),
+                                    for (final reason in waitingReasons)
+                                      if ((reason['latitude'] as num?) != null &&
+                                          (reason['longitude'] as num?) != null)
+                                        Marker(
+                                          markerId: MarkerId(
+                                            'waiting-reason-${reason['id']}',
+                                          ),
+                                          position: LatLng(
+                                            (reason['latitude'] as num).toDouble(),
+                                            (reason['longitude'] as num).toDouble(),
+                                          ),
+                                          icon: BitmapDescriptor.defaultMarkerWithHue(
+                                            _selectedWaitingReasonId == reason['id']
+                                                ? BitmapDescriptor.hueAzure
+                                                : BitmapDescriptor.hueOrange,
+                                          ),
+                                          infoWindow: const InfoWindow(
+                                            title: 'Waiting reason',
+                                          ),
+                                          onTap: () => _selectWaitingReason(reason),
+                                        ),
                                   },
                                   mapToolbarEnabled: false,
                                   zoomControlsEnabled: true,
@@ -1377,7 +1425,12 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
           ),
           if (!loading && error == null) ...[
             const SizedBox(height: 14),
-            _RouteProgressBar(activities: activities),
+            _RouteProgressBar(
+              activities: activities,
+              waitingReasons: waitingReasons,
+              selectedWaitingReasonId: _selectedWaitingReasonId,
+              onWaitingReasonSelected: _selectWaitingReason,
+            ),
           ],
         ],
       ),
@@ -1514,8 +1567,16 @@ class _HybridActivityTimeline extends StatelessWidget {
 }
 
 class _RouteProgressBar extends StatelessWidget {
-  const _RouteProgressBar({required this.activities});
+  const _RouteProgressBar({
+    required this.activities,
+    required this.waitingReasons,
+    required this.selectedWaitingReasonId,
+    required this.onWaitingReasonSelected,
+  });
   final List<Map> activities;
+  final List<Map> waitingReasons;
+  final int? selectedWaitingReasonId;
+  final ValueChanged<Map> onWaitingReasonSelected;
 
   @override
   Widget build(BuildContext context) {
@@ -1525,6 +1586,35 @@ class _RouteProgressBar extends StatelessWidget {
         '${activities[index.clamp(0, activities.length - 1)]['recordedAt'] ?? ''}',
       )?.toLocal();
       return parsed == null ? '--:--' : DateFormat('h:mm a').format(parsed);
+    }
+
+    DateTime? timestamp(dynamic value) =>
+        DateTime.tryParse('$value')?.toLocal();
+    final eventTimes = waitingReasons
+        .map((reason) => timestamp(reason['submittedAt']))
+        .whereType<DateTime>()
+        .toList();
+    final routeStart = activities.isEmpty
+        ? null
+        : timestamp(activities.first['recordedAt']);
+    final routeEnd = activities.isEmpty
+        ? null
+        : timestamp(activities.last['recordedAt']);
+    final lowerBound = routeStart ??
+        (eventTimes.isEmpty ? null : eventTimes.reduce((a, b) => a.isBefore(b) ? a : b));
+    final upperBound = routeEnd ??
+        (eventTimes.isEmpty ? null : eventTimes.reduce((a, b) => a.isAfter(b) ? a : b));
+    final totalMilliseconds = lowerBound == null || upperBound == null
+        ? 0
+        : upperBound.difference(lowerBound).inMilliseconds;
+
+    double eventPosition(Map reason) {
+      final eventTime = timestamp(reason['submittedAt']);
+      if (eventTime == null || lowerBound == null || totalMilliseconds <= 0) return .5;
+      return (eventTime.difference(lowerBound).inMilliseconds /
+              totalMilliseconds)
+          .clamp(.03, .97)
+          .toDouble();
     }
 
     return Container(
@@ -1552,32 +1642,46 @@ class _RouteProgressBar extends StatelessWidget {
           ),
           const SizedBox(width: 12),
           Expanded(
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                Container(height: 3, color: const Color(0xFFBFD2FF)),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: List.generate(
-                    activities.isEmpty ? 2 : activities.length.clamp(2, 6),
-                    (index) => Container(
-                      width: 11,
-                      height: 11,
-                      decoration: BoxDecoration(
-                        color: index == 0
-                            ? _desktopGreen
-                            : index ==
-                                  (activities.isEmpty
-                                      ? 1
-                                      : activities.length.clamp(2, 6) - 1)
-                            ? _desktopRed
-                            : HrmsColors.blue,
-                        shape: BoxShape.circle,
+            child: LayoutBuilder(
+              builder: (context, constraints) => Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(height: 3, color: const Color(0xFFBFD2FF)),
+                  Positioned(left: 0, child: _routeEndpoint(_desktopGreen)),
+                  if (activities.length > 1)
+                    Positioned(right: 0, child: _routeEndpoint(_desktopRed)),
+                  for (final reason in waitingReasons)
+                    Positioned(
+                      left: eventPosition(reason) * constraints.maxWidth,
+                      child: Transform.translate(
+                        offset: const Offset(-9, 0),
+                        child: Tooltip(
+                          message: '${reason['reason'] ?? 'Waiting reason'}',
+                          child: InkWell(
+                            onTap: () => onWaitingReasonSelected(reason),
+                            customBorder: const CircleBorder(),
+                            child: Container(
+                              width: 18,
+                              height: 18,
+                              decoration: BoxDecoration(
+                                color: selectedWaitingReasonId == reason['id']
+                                    ? HrmsColors.blue
+                                    : _desktopOrange,
+                                border: Border.all(color: Colors.white, width: 2),
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.chat_bubble_outline_rounded,
+                                size: 9,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
           const SizedBox(width: 12),
@@ -1587,6 +1691,52 @@ class _RouteProgressBar extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _routeEndpoint(Color color) => Container(
+    width: 11,
+    height: 11,
+    decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+  );
+}
+
+class _WaitingReasonDetailsDialog extends StatelessWidget {
+  const _WaitingReasonDetailsDialog({
+    required this.employeeName,
+    required this.reason,
+  });
+
+  final String employeeName;
+  final Map reason;
+
+  @override
+  Widget build(BuildContext context) {
+    final submittedAt = DateTime.tryParse('${reason['submittedAt'] ?? ''}')
+        ?.toLocal();
+    final reviewed = '${reason['reviewStatus'] ?? 'pending'}'.toLowerCase() ==
+        'reviewed';
+    return AlertDialog(
+      title: const Text('Waiting reason'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(employeeName, style: const TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 12),
+          Text('${reason['reason'] ?? 'No reason provided'}'),
+          const SizedBox(height: 12),
+          Text('Submitted: ${submittedAt == null ? '--' : DateFormat('dd MMM yyyy, h:mm a').format(submittedAt)}'),
+          const SizedBox(height: 6),
+          Text('Status: ${reviewed ? 'Reviewed' : 'Pending review'}'),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
     );
   }
 }

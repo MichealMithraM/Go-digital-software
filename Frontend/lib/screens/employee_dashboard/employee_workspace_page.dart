@@ -54,6 +54,8 @@ class EmployeeWorkspacePage extends StatefulWidget {
 
 class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
   _WorkspaceClient? _selectedClient;
+  // Client whose previous / current cards are open (key = _clientKey(name)).
+  String? _openGroup;
   Map<String, dynamic>? _pendingFocus;
   String? _focusSection;
   int _focusStamp = 0;
@@ -78,46 +80,68 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
   }
 
   /// Pick the card for a pending focus request once the cards are loaded.
+  /// An additional task lives inside its client's existing card, so a focus
+  /// on an additional task's own date opens that card on "Additional Tasks".
   void _applyFocus(List<_WorkspaceClient> clients) {
     final focus = _pendingFocus;
     if (focus == null) return;
-    final name = '${focus['client'] ?? ''}'.trim().toLowerCase();
+    final name = _clientKey('${focus['client'] ?? ''}');
     final due = '${focus['due_date'] ?? ''}';
     final sameClient = clients
-        .where((c) => c.name.trim().toLowerCase() == name)
+        .where((c) => _clientKey(c.name) == name)
         .toList();
     if (sameClient.isEmpty) {
       _pendingFocus = null;
       return;
     }
+    bool viaExtra(_WorkspaceClient c) =>
+        due.isNotEmpty &&
+        c.additionalDates.any((x) => _dateKey(x) == _dateKey(due));
     final match = sameClient.firstWhere(
-      (c) => due.isNotEmpty && _dateKey(c.submissionDate) == _dateKey(due),
+      (c) =>
+          due.isNotEmpty &&
+          (_dateKey(c.submissionDate) == _dateKey(due) || viaExtra(c)),
       orElse: () => sameClient.first,
     );
     setState(() {
       _selectedClient = match;
-      _focusSection = '${focus['section'] ?? 'My Tasks'}';
+      _openGroup = _clientKey(match.name);
+      _focusSection = viaExtra(match)
+          ? 'Additional Tasks'
+          : '${focus['section'] ?? 'My Tasks'}';
       _pendingFocus = null;
     });
   }
 
-  List<_WorkspaceSection> _clientSections() {
+  /// 'Page Handler' / 'Ads Handler' when the Tasks Assign screen names this
+  /// employee as such for the client (or they prepare its calendar), else null.
+  String? _handlerRoleFor(_WorkspaceClient client) {
+    for (final t in client.tasks) {
+      if (t.role == 'Ads Handler') return 'Ads Handler';
+    }
+    for (final t in client.tasks) {
+      if (t.role == 'Page Handler' || t.role == 'Content Calendar') {
+        return 'Page Handler';
+      }
+    }
+    return null;
+  }
+
+  List<_WorkspaceSection> _clientSections(_WorkspaceClient client) {
     final pages = widget.allowedPages.toSet();
     final sections = <_WorkspaceSection>[
       _WorkspaceSection('My Tasks', Icons.task_alt_rounded),
     ];
-    if (pages.contains('Additional Task')) {
+    if (pages.contains('Additional Task') ||
+        client.additionalDates.isNotEmpty) {
       sections.add(
         _WorkspaceSection('Additional Tasks', Icons.add_task_rounded),
       );
     }
-    final canSeeContentCalendar =
-        widget.role == EmployeeRole.pageHandler ||
-        widget.role == EmployeeRole.adsHandler;
-    // Page Handler and Ads Handler both work with client content calendars.
-    // Match the reference Client workspace: their assigned client cards open
-    // the calendar inside that client's workspace, without requiring a
-    // separate Content Calendar page permission.
+    // The Content Calendar belongs to the client's assignment (Tasks Assign):
+    // it shows when this employee is the Page / Ads Handler for THIS client,
+    // whatever their job role is.
+    final canSeeContentCalendar = _handlerRoleFor(client) != null;
     if (canSeeContentCalendar) {
       sections.add(
         _WorkspaceSection('Content Calendar', Icons.event_note_rounded),
@@ -162,7 +186,7 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
       _pendingFocus = {
         'client': created['client'],
         'due_date': created['due_date'],
-        'section': 'My Tasks',
+        'section': 'Additional Tasks',
       };
       _selectedClient = null;
       _focusStamp++; // reload the cards, then open the new one
@@ -256,6 +280,8 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
                           }
                         }
                       },
+                      openGroup: _openGroup,
+                      onOpenGroup: (key) => setState(() => _openGroup = key),
                       onSelectClient: (client) {
                         setState(() {
                           _focusSection = null;
@@ -283,7 +309,7 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
     String rawRole,
   ) {
     final client = _selectedClient!;
-    final sections = _clientSections();
+    final sections = _clientSections(client);
     if (sections.isEmpty) {
       return Center(
         child: _ClientContextHeader(
@@ -322,10 +348,15 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
                 border: Border.all(color: const Color(0xFFE2E8F0)),
               ),
               child: _CountedTabBar(
-                key: ValueKey('tabs-${client.name}-${client.submissionDate}'),
+                key: ValueKey(
+                  'tabs-${client.name}-${client.submissionDate}-${client.additionalDates.join()}',
+                ),
                 sections: sections,
                 clientName: client.name,
                 submissionDate: client.submissionDate,
+                extraDates: client.additionalDates,
+                additionalOpen: client.additionalOpen,
+                additionalOpenSameDate: client.additionalSameDateOpen,
                 employeeName: employeeName,
                 authToken: authToken,
               ),
@@ -366,6 +397,9 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
       case 'My Tasks':
         return WorkspaceMyTasksSection(
           key: ValueKey('my-tasks-${client.name}-${client.submissionDate}'),
+          // Additional work lives in its own tab (except on a card that only
+          // has additional work).
+          view: client.additionalOnly ? null : 'main',
           clientName: client.name,
           submissionDate: client.submissionDate,
           employeeName: employeeName,
@@ -375,10 +409,33 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
               : () => widget.onNavigate!('Day Planner'),
         );
       case 'Additional Tasks':
-        return _ClientTasksSection(
-          client: client,
-          includeAdditional: true,
-          title: 'Additional tasks',
+        // No additional task attached to this card → plain list.
+        if (client.additionalDates.isEmpty) {
+          return _ClientTasksSection(
+            client: client,
+            includeAdditional: true,
+            title: 'Additional tasks',
+          );
+        }
+        // Each additional task keeps its own submit date: its work is loaded
+        // (and later reviewed) by that date, never with the whole card.
+        return _DateSwitcher(
+          key: ValueKey('add-${client.name}-${client.additionalDates.join()}'),
+          entries: [
+            for (final d in client.additionalDates)
+              (label: 'Additional · ${_formatDate(d)}', date: d),
+          ],
+          builder: (date) => WorkspaceMyTasksSection(
+            key: ValueKey('add-tasks-${client.name}-$date'),
+            view: 'additional',
+            clientName: client.name,
+            submissionDate: date,
+            employeeName: employeeName,
+            authToken: authToken,
+            onOpenDayPlanner: widget.onNavigate == null
+                ? null
+                : () => widget.onNavigate!('Day Planner'),
+          ),
         );
       case 'Content Calendar':
         return ContentCalendarScreen(
@@ -387,7 +444,8 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
           authToken: authToken,
           currentUserId: employeeId,
           currentUserName: employeeName,
-          currentUserRole: rawRole,
+          currentUserRole: _handlerRoleFor(client) ?? rawRole,
+          viaAssignment: true,
           initialClient: {
             'client_name': client.name,
             'submission_date': client.submissionDate,
@@ -395,12 +453,36 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
           myTasksMode: true,
         );
       case 'Task Review':
-        return WorkspaceTaskReviewSection(
-          key: ValueKey('task-review-${client.name}-${client.submissionDate}'),
-          clientName: client.name,
-          submissionDate: client.submissionDate,
-          employeeName: employeeName,
-          authToken: authToken,
+        if (client.additionalDates.isEmpty) {
+          return WorkspaceTaskReviewSection(
+            key: ValueKey(
+              'task-review-${client.name}-${client.submissionDate}',
+            ),
+            clientName: client.name,
+            submissionDate: client.submissionDate,
+            employeeName: employeeName,
+            authToken: authToken,
+          );
+        }
+        // Main work and each additional task are reviewed separately.
+        return _DateSwitcher(
+          key: ValueKey('rev-${client.name}-${client.additionalDates.join()}'),
+          entries: [
+            (
+              label: 'Main · ${_formatDate(client.submissionDate)}',
+              date: client.submissionDate,
+            ),
+            for (final d in client.additionalDates)
+              if (_dayKey(d) != _dayKey(client.submissionDate))
+                (label: 'Additional · ${_formatDate(d)}', date: d),
+          ],
+          builder: (date) => WorkspaceTaskReviewSection(
+            key: ValueKey('task-review-${client.name}-$date'),
+            clientName: client.name,
+            submissionDate: date,
+            employeeName: employeeName,
+            authToken: authToken,
+          ),
         );
       case 'Team Chat':
         return _WorkspaceTeamChat(
@@ -419,6 +501,53 @@ class _EmployeeWorkspacePageState extends State<EmployeeWorkspacePage> {
           child: Text('This client workspace section is unavailable.'),
         );
     }
+  }
+}
+
+/// Chips that switch the date a section (Additional Tasks / Task Review)
+/// loads its data for.
+class _DateSwitcher extends StatefulWidget {
+  final List<({String label, String date})> entries;
+  final Widget Function(String date) builder;
+
+  const _DateSwitcher({
+    super.key,
+    required this.entries,
+    required this.builder,
+  });
+
+  @override
+  State<_DateSwitcher> createState() => _DateSwitcherState();
+}
+
+class _DateSwitcherState extends State<_DateSwitcher> {
+  int _i = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final i = _i.clamp(0, widget.entries.length - 1);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (widget.entries.length > 1)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: [
+                for (var k = 0; k < widget.entries.length; k++)
+                  ChoiceChip(
+                    label: Text(widget.entries[k].label),
+                    selected: k == i,
+                    onSelected: (_) => setState(() => _i = k),
+                  ),
+              ],
+            ),
+          ),
+        Expanded(child: widget.builder(widget.entries[i].date)),
+      ],
+    );
   }
 }
 
@@ -537,12 +666,19 @@ class _WorkspaceHeader extends StatelessWidget {
 }
 
 /// Workspace tabs with live count badges:
-///   My Tasks    → rows still to do (tooltip lists the categories)
-///   Task Review → team work waiting for this Ads / Page Handler's decision
+///   My Tasks         → rows still to do (tooltip lists the categories)
+///   Additional Tasks → pending rows of the additional tasks on this card
+///   Task Review      → team work waiting for this Ads / Page Handler's decision
+///                      (main work + additional tasks)
 class _CountedTabBar extends StatefulWidget {
   final List<_WorkspaceSection> sections;
   final String clientName;
   final String submissionDate;
+  // Own submit dates of additional tasks attached to this card.
+  final List<String> extraDates;
+  // Open additional rows (all dates) and the part sharing the card's own date.
+  final int additionalOpen;
+  final int additionalOpenSameDate;
   final String employeeName;
   final String authToken;
 
@@ -551,6 +687,9 @@ class _CountedTabBar extends StatefulWidget {
     required this.sections,
     required this.clientName,
     required this.submissionDate,
+    this.extraDates = const [],
+    this.additionalOpen = 0,
+    this.additionalOpenSameDate = 0,
     required this.employeeName,
     required this.authToken,
   });
@@ -598,38 +737,50 @@ class _CountedTabBarState extends State<_CountedTabBar> {
     super.dispose();
   }
 
+  int _n(dynamic v) => int.tryParse('${v ?? 0}') ?? 0;
+
+  Future<Map?> _counts(String raw) async {
+    final date = raw.length >= 10 ? raw.substring(0, 10) : raw;
+    final uri = Uri.parse('${ApiConfig.baseUrl}/workspace-tasks/counts').replace(
+      queryParameters: {
+        'employee': widget.employeeName,
+        'client': widget.clientName,
+        'date': date,
+      },
+    );
+    final res = await http.get(
+      uri,
+      headers: {
+        if (widget.authToken.isNotEmpty)
+          'Authorization': 'Bearer ${widget.authToken}',
+      },
+    );
+    if (res.statusCode != 200) return null;
+    return jsonDecode(res.body)['data'] as Map?;
+  }
+
   Future<void> _load() async {
     try {
-      final date = widget.submissionDate.length >= 10
-          ? widget.submissionDate.substring(0, 10)
-          : widget.submissionDate;
-      final uri = Uri.parse('${ApiConfig.baseUrl}/workspace-tasks/counts')
-          .replace(
-            queryParameters: {
-              'employee': widget.employeeName,
-              'client': widget.clientName,
-              'date': date,
-            },
-          );
-      final res = await http.get(
-        uri,
-        headers: {
-          if (widget.authToken.isNotEmpty)
-            'Authorization': 'Bearer ${widget.authToken}',
-        },
-      );
-      if (res.statusCode != 200 || !mounted) return;
-      final data = jsonDecode(res.body)['data'] as Map? ?? {};
-      final my = data['my_tasks'] as Map? ?? {};
-      final review = data['review'] as Map? ?? {};
+      final main = await _counts(widget.submissionDate);
+      if (main == null || !mounted) return;
+      final my = main['my_tasks'] as Map? ?? {};
+      var toReview = _n((main['review'] as Map?)?['to_review']);
+      for (final d in widget.extraDates) {
+        // Same date as the card is already inside the main counts.
+        if (_dayKey(d) == _dayKey(widget.submissionDate)) continue;
+        final data = await _counts(d);
+        if (data == null) continue;
+        toReview += _n((data['review'] as Map?)?['to_review']);
+      }
+      if (!mounted) return;
       final categories = (my['by_category'] as List? ?? [])
           .whereType<Map>()
           .map((c) => '${c['name']}: ${c['pending']}')
           .join('\n');
       setState(() {
-        _myPending = int.tryParse('${my['pending'] ?? 0}') ?? 0;
+        _myPending = _n(my['pending']);
         _myTooltip = categories;
-        _toReview = int.tryParse('${review['to_review'] ?? 0}') ?? 0;
+        _toReview = toReview;
       });
     } catch (_) {
       // Badges are optional — keep the last values on a network hiccup.
@@ -638,7 +789,11 @@ class _CountedTabBarState extends State<_CountedTabBar> {
 
   Widget _tab(_WorkspaceSection section) {
     final count = switch (section.title) {
-      'My Tasks' => _myPending,
+      'My Tasks' =>
+        _myPending > widget.additionalOpenSameDate
+            ? _myPending - widget.additionalOpenSameDate
+            : 0,
+      'Additional Tasks' => widget.additionalOpen,
       'Task Review' => _toReview,
       _ => 0,
     };
@@ -2099,8 +2254,108 @@ class _WorkspaceTeamChatState extends State<_WorkspaceTeamChat> {
   }
 }
 
+/// Same client whatever the spacing / punctuation / case.
+String _clientKey(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+
+String _dayKey(String s) => s.length >= 10 ? s.substring(0, 10) : s;
+
 bool _chatIsGroup(dynamic value) =>
     value == true || value == 1 || value?.toString() == '1';
+
+/// One client = one card in the list. Opening it shows ONLY the current card
+/// (nearest submit date today or later) and the previous card (latest before
+/// today). Older cards are not shown.
+class _ClientGroup {
+  final String key;
+  final String name;
+  final _WorkspaceClient? previous;
+  final _WorkspaceClient? current;
+
+  const _ClientGroup(this.key, this.name, this.previous, this.current);
+
+  _WorkspaceClient get head => current ?? previous!;
+
+  List<(String, _WorkspaceClient)> get cards => [
+    if (current != null) ('CURRENT', current!),
+    if (previous != null) ('PREVIOUS', previous!),
+  ];
+}
+
+/// The server puts additional work on the card of its own submit date. When
+/// that card also holds normal work, pull the additional part out so it can
+/// be shown in the card's Additional Tasks tab instead of My Tasks.
+List<_WorkspaceClient> _splitSameDateCards(List<_WorkspaceClient> cards) {
+  bool extra(_WorkspaceTask t) => t.isAdditional || t.handlerAssigned;
+  final out = <_WorkspaceClient>[];
+  for (final c in cards) {
+    final add = c.tasks.where(extra).toList();
+    final main = c.tasks.where((t) => !extra(t)).toList();
+    if (add.isEmpty || main.isEmpty) {
+      out.add(c);
+      continue;
+    }
+    out.add(c.copyWithTasks(main));
+    out.add(
+      _WorkspaceClient(
+        name: c.name,
+        submissionDate: c.submissionDate,
+        employeeRole: c.employeeRole,
+        tasks: add,
+        assignedAt: c.assignedAt,
+        isAdditional: true,
+        additionalBy: c.additionalBy,
+        package: c.package,
+        maintenanceDay: c.maintenanceDay,
+      ),
+    );
+  }
+  return out;
+}
+
+/// An additional task NEVER gets its own card. It joins the card of its own
+/// submit date; otherwise the client's CURRENT card (nearest submit date today
+/// or later), or the latest card when none is upcoming. Only a client with no
+/// card at all keeps it standalone.
+List<_WorkspaceClient> _attachAdditionalCards(List<_WorkspaceClient> cards) {
+  final t = DateTime.now();
+  final today = DateTime(t.year, t.month, t.day);
+  DateTime d(_WorkspaceClient c) => c.dueDate ?? DateTime(2100);
+
+  final hosts = cards.where((c) => !c.additionalOnly).toList();
+  final extras = cards.where((c) => c.additionalOnly);
+  final attached = <_WorkspaceClient, List<_WorkspaceClient>>{};
+  final standalone = <_WorkspaceClient>[];
+
+  for (final extra in extras) {
+    final mine = hosts
+        .where((h) => _clientKey(h.name) == _clientKey(extra.name))
+        .toList();
+    if (mine.isEmpty) {
+      standalone.add(extra);
+      continue;
+    }
+    final sameDay = mine
+        .where((h) => _dayKey(h.submissionDate) == _dayKey(extra.submissionDate))
+        .toList();
+    _WorkspaceClient host;
+    if (sameDay.isNotEmpty) {
+      host = sameDay.first;
+    } else {
+      mine.sort((a, b) => d(a).compareTo(d(b)));
+      final upcoming = mine.where((h) => !d(h).isBefore(today)).toList();
+      host = upcoming.isNotEmpty ? upcoming.first : mine.last;
+    }
+    (attached[host] ??= []).add(extra);
+  }
+  return [
+    for (final h in hosts)
+      attached[h] == null ? h : h.withAdditional(attached[h]!),
+    ...standalone,
+  ];
+}
+
+List<_WorkspaceClient> _arrangeCards(List<_WorkspaceClient> cards) =>
+    _attachAdditionalCards(_splitSameDateCards(cards));
 
 class _WorkspaceClient {
   final String name;
@@ -2117,6 +2372,15 @@ class _WorkspaceClient {
   // task → "ADDITIONAL TASK" ribbon. e.g. ['VIJI (Page Handler)']
   final bool isAdditional;
   final List<String> additionalBy;
+  // Own submit dates of additional tasks attached INSIDE this card (instead of
+  // showing them as separate cards). Each date is used to load / review only
+  // that additional task's work.
+  final List<String> additionalDates;
+  // Open rows of additional work that shares THIS card's own submit date.
+  final int additionalSameDateOpen;
+  // From Tasks Assign: the package and the monthly maintain day (e.g. '12').
+  final String package;
+  final String maintenanceDay;
 
   const _WorkspaceClient({
     required this.name,
@@ -2128,11 +2392,89 @@ class _WorkspaceClient {
     this.team = const [],
     this.isAdditional = false,
     this.additionalBy = const [],
+    this.additionalDates = const [],
+    this.additionalSameDateOpen = 0,
+    this.package = '',
+    this.maintenanceDay = '',
   });
 
   DateTime? get dueDate {
     final d = DateTime.tryParse(submissionDate);
     return d == null ? null : DateTime(d.year, d.month, d.day);
+  }
+
+  /// A card that only holds additional / handler-assigned work.
+  bool get additionalOnly =>
+      tasks.isNotEmpty &&
+      tasks.every((t) => t.isAdditional || t.handlerAssigned);
+
+  /// Rows of the additional work on this card (for the card chip).
+  int get additionalRows => tasks
+      .where((t) => t.isAdditional || t.handlerAssigned)
+      .fold(0, (s, t) => s + t.total);
+
+  /// Additional rows still to do (drives the Additional Tasks tab badge).
+  int get additionalOpen => tasks
+      .where((t) => t.isAdditional || t.handlerAssigned)
+      .fold(
+        0,
+        (s, t) =>
+            s + t.pendingCount + t.inProgressCount + t.onHoldCount + t.reworkCount,
+      );
+
+  _WorkspaceClient copyWithTasks(List<_WorkspaceTask> newTasks) =>
+      _WorkspaceClient(
+        name: name,
+        submissionDate: submissionDate,
+        employeeRole: employeeRole,
+        tasks: newTasks,
+        toReview: toReview,
+        assignedAt: assignedAt,
+        team: team,
+        package: package,
+        maintenanceDay: maintenanceDay,
+      );
+
+  /// This card plus the additional-only cards attached to it.
+  _WorkspaceClient withAdditional(List<_WorkspaceClient> extra) {
+    final mergedTeam = team.map((m) => Map<String, dynamic>.from(m)).toList();
+    for (final e in extra) {
+      for (final m in e.team) {
+        final i = mergedTeam.indexWhere(
+          (x) =>
+              '${x['employee']}'.toLowerCase() ==
+              '${m['employee']}'.toLowerCase(),
+        );
+        if (i < 0) {
+          mergedTeam.add(Map<String, dynamic>.from(m));
+        } else {
+          mergedTeam[i]['tasks'] = [
+            ...(mergedTeam[i]['tasks'] as List? ?? []),
+            ...(m['tasks'] as List? ?? []),
+          ];
+        }
+      }
+    }
+    return _WorkspaceClient(
+      name: name,
+      submissionDate: submissionDate,
+      employeeRole: employeeRole,
+      tasks: [...tasks, ...extra.expand((e) => e.tasks)],
+      toReview: toReview + extra.fold(0, (s, e) => s + e.toReview),
+      assignedAt: assignedAt,
+      team: mergedTeam,
+      isAdditional: true,
+      additionalBy: {
+        ...additionalBy,
+        ...extra.expand((e) => e.additionalBy),
+      }.toList(),
+      additionalDates: {...extra.map((e) => e.submissionDate)}.toList(),
+      additionalSameDateOpen: extra
+          .where((e) => _dayKey(e.submissionDate) == _dayKey(submissionDate))
+          .fold(0, (s, e) => s + e.additionalOpen),
+      package: package,
+      maintenanceDay: maintenanceDay,
+    );
   }
 
   bool get isCompleted => totalRows > 0 && completed >= totalRows;
@@ -2248,6 +2590,8 @@ class _ClientWorkspace extends StatefulWidget {
   final bool showAdditionalTasks;
   final ValueChanged<List<_WorkspaceClient>> onClientsLoaded;
   final ValueChanged<_WorkspaceClient> onSelectClient;
+  final String? openGroup;
+  final ValueChanged<String?> onOpenGroup;
   final String searchQuery;
 
   const _ClientWorkspace({
@@ -2259,6 +2603,8 @@ class _ClientWorkspace extends StatefulWidget {
     required this.showAdditionalTasks,
     required this.onClientsLoaded,
     required this.onSelectClient,
+    required this.openGroup,
+    required this.onOpenGroup,
     this.searchQuery = '',
   });
 
@@ -2422,6 +2768,8 @@ class _ClientWorkspaceState extends State<_ClientWorkspace> {
             assignedAt: DateTime.tryParse(
               '${card['assigned_at'] ?? ''}',
             )?.toLocal(),
+            package: '${card['package'] ?? ''}'.trim(),
+            maintenanceDay: '${card['maintenance_day'] ?? ''}'.trim(),
             team: (card['team'] as List? ?? [])
                 .whereType<Map>()
                 .map((t) => Map<String, dynamic>.from(t))
@@ -2437,12 +2785,13 @@ class _ClientWorkspaceState extends State<_ClientWorkspace> {
         );
       }
 
+      final merged = _arrangeCards(loadedClients);
       if (!mounted) return;
       setState(() {
-        _clients = loadedClients;
+        _clients = merged;
         _loading = false;
       });
-      widget.onClientsLoaded(loadedClients);
+      widget.onClientsLoaded(merged);
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -2494,7 +2843,14 @@ class _ClientWorkspaceState extends State<_ClientWorkspace> {
       );
     }
 
-    final windowed = _windowed();
+    final groups = _buildGroups(_clients);
+    final openGroup = widget.openGroup == null
+        ? null
+        : groups.where((g) => g.key == widget.openGroup).firstOrNull;
+    if (openGroup != null) return _buildGroupView(openGroup);
+
+    // One card per client (its current / latest card represents it).
+    final windowed = _windowed(groups.map((g) => g.head).toList());
     final visible = _filtered(windowed);
 
     // GODIGITAL_PINNED_FILTER_V4
@@ -2536,13 +2892,13 @@ class _ClientWorkspaceState extends State<_ClientWorkspace> {
                     return Padding(
                       padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
                       child: SizedBox(
-                        height: 390,
+                        height: 412,
                         child: _RibbonedCard(
                           ribbon: client.ribbon,
                           additional: client.isAdditional,
                           child: _ClientCard(
                             client: client,
-                            onOpen: () => widget.onSelectClient(client),
+                            onOpen: () => widget.onOpenGroup(_clientKey(client.name)),
                           ),
                         ),
                       ),
@@ -2586,7 +2942,7 @@ class _ClientWorkspaceState extends State<_ClientWorkspace> {
                           crossAxisCount: columns,
                           crossAxisSpacing: 16,
                           mainAxisSpacing: 16,
-                          mainAxisExtent: 330,
+                          mainAxisExtent: 352,
                         ),
                         itemCount: visible.length,
                         itemBuilder: (context, index) => _RibbonedCard(
@@ -2594,7 +2950,7 @@ class _ClientWorkspaceState extends State<_ClientWorkspace> {
                           additional: visible[index].isAdditional,
                           child: _ClientCard(
                             client: visible[index],
-                            onOpen: () => widget.onSelectClient(visible[index]),
+                            onOpen: () => widget.onOpenGroup(_clientKey(visible[index].name)),
                           ),
                         ),
                       );
@@ -2606,13 +2962,168 @@ class _ClientWorkspaceState extends State<_ClientWorkspace> {
     );
   }
 
+  /// Per client: ONLY the current card (nearest submit date today or later)
+  /// and the previous card (latest before today).
+  List<_ClientGroup> _buildGroups(List<_WorkspaceClient> cards) {
+    final t = DateTime.now();
+    final today = DateTime(t.year, t.month, t.day);
+    DateTime due(_WorkspaceClient c) => c.dueDate ?? DateTime(2100);
+    final byClient = <String, List<_WorkspaceClient>>{};
+    for (final c in cards) {
+      (byClient[_clientKey(c.name)] ??= []).add(c);
+    }
+    final out = <_ClientGroup>[];
+    byClient.forEach((key, list) {
+      list.sort((a, b) => due(a).compareTo(due(b)));
+      final upcoming = list.where((c) => !due(c).isBefore(today)).toList();
+      final past = list.where((c) => due(c).isBefore(today)).toList();
+      out.add(
+        _ClientGroup(
+          key,
+          list.first.name,
+          past.isEmpty ? null : past.last,
+          upcoming.isEmpty ? null : upcoming.first,
+        ),
+      );
+    });
+    return out;
+  }
+
+  Widget _metaChip(IconData icon, String text) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+    decoration: BoxDecoration(
+      color: const Color(0xFFEFF5FF),
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(color: const Color(0xFFBFDBFE)),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 14, color: const Color(0xFF1456C0)),
+        const SizedBox(width: 5),
+        Text(
+          text,
+          style: const TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w700,
+            color: Color(0xFF1456C0),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  /// Inside a client: previous card, current card and (tagged) additional work.
+  Widget _buildGroupView(_ClientGroup g) {
+    final cards = g.cards;
+    final head = g.head;
+    final maint = head.maintenanceDay.isNotEmpty
+        ? head.maintenanceDay
+        : (head.dueDate == null ? '' : '${head.dueDate!.day}');
+    final pkg = cards
+        .map((c) => c.$2.package)
+        .firstWhere((p) => p.isNotEmpty, orElse: () => '');
+    Color labelColor(String l) =>
+        l == 'CURRENT' ? const Color(0xFF15803D) : const Color(0xFF475569);
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0xFFE2E8F0)),
+          ),
+          child: Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 10,
+            runSpacing: 8,
+            children: [
+              TextButton.icon(
+                onPressed: () => widget.onOpenGroup(null),
+                icon: const Icon(Icons.arrow_back_rounded, size: 17),
+                label: const Text('All clients'),
+              ),
+              Text(
+                g.name,
+                style: const TextStyle(
+                  color: Color(0xFF14213D),
+                  fontWeight: FontWeight.w800,
+                  fontSize: 19,
+                ),
+              ),
+              if (maint.isNotEmpty)
+                _metaChip(Icons.build_circle_outlined, 'Maintain date: $maint'),
+              if (pkg.isNotEmpty) _metaChip(Icons.inventory_2_outlined, pkg),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        LayoutBuilder(
+          builder: (context, c) {
+            final w = c.maxWidth < 440 ? c.maxWidth : 420.0;
+            return Wrap(
+              spacing: 16,
+              runSpacing: 18,
+              children: [
+                for (final entry in cards)
+                  SizedBox(
+                    width: w,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          margin: const EdgeInsets.only(bottom: 8, left: 4),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: labelColor(entry.$1).withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(
+                            '${entry.$1} · ${_formatDate(entry.$2.submissionDate)}',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0.4,
+                              color: labelColor(entry.$1),
+                            ),
+                          ),
+                        ),
+                        SizedBox(
+                          height: 352,
+                          child: _RibbonedCard(
+                            ribbon: entry.$2.ribbon,
+                            additional: entry.$2.isAdditional,
+                            child: _ClientCard(
+                              client: entry.$2,
+                              showMeta: false,
+                              onOpen: () => widget.onSelectClient(entry.$2),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+
   // Last 2 months (and anything upcoming). Older cards only while they still
   // have open work — unless "Show older" is on.
-  List<_WorkspaceClient> _windowed() {
-    if (_showOlder) return _clients;
+  List<_WorkspaceClient> _windowed(List<_WorkspaceClient> source) {
+    if (_showOlder) return source;
     final now = DateTime.now();
     final cutoff = DateTime(now.year, now.month - 2, now.day);
-    return _clients.where((c) {
+    return source.where((c) {
       final due = c.dueDate;
       if (due == null || !due.isBefore(cutoff)) return true;
       return c.hasOpenWork;
@@ -3053,7 +3564,15 @@ class _ClientCard extends StatelessWidget {
   final _WorkspaceClient client;
   final VoidCallback onOpen;
 
-  const _ClientCard({required this.client, required this.onOpen});
+  // Show the maintain date + package line (client list); the opened client
+  // already shows them in its header.
+  final bool showMeta;
+
+  const _ClientCard({
+    required this.client,
+    required this.onOpen,
+    this.showMeta = true,
+  });
 
   static Widget _taskLine(
     String name,
@@ -3545,6 +4064,25 @@ class _ClientCard extends StatelessWidget {
                 ],
               ],
             ),
+            if (showMeta &&
+                (client.package.isNotEmpty ||
+                    client.maintenanceDay.isNotEmpty)) ...[
+              const SizedBox(height: 6),
+              Text(
+                [
+                  if (client.maintenanceDay.isNotEmpty)
+                    'Maintain date: ${client.maintenanceDay}',
+                  if (client.package.isNotEmpty) client.package,
+                ].join('  ·  '),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Color(0xFF1456C0),
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
             const SizedBox(height: 12),
             _ClientStatTiles(client: client, compact: true),
             const SizedBox(height: 12),
@@ -3590,6 +4128,12 @@ class _ClientCard extends StatelessWidget {
                     'To review',
                     client.toReview,
                     const Color(0xFFDC2626),
+                  ),
+                if (client.additionalRows > 0)
+                  _CountChip(
+                    'Additional',
+                    client.additionalRows,
+                    const Color(0xFF7C3AED),
                   ),
                 _CountChip(
                   'Complete',

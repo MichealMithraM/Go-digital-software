@@ -2,7 +2,7 @@ import 'package:godigital_portal/services/socket_auth.dart';
 import 'package:godigital_portal/services/auth_storage.dart';
 // lib/screens/employee_dashboard/workspace_my_tasks_section.dart
 //
-// Employee Workspace → Client → "My Tasks".
+// Employee Workspace → Client → "My Tasks" / "Additional Tasks".
 // Shows only this employee's tasks for the selected client + submit date,
 // one category (deliverable) at a time.
 //
@@ -12,6 +12,11 @@ import 'package:godigital_portal/services/auth_storage.dart';
 //                    and Submit Date are editable on a nested row.
 //  • Other roles   : rows appear only after the Page/Ads Handler completes the
 //                    Content Calendar sheet and assigns it.
+//
+// `view` picks which groups are listed:
+//   null          → everything for the date
+//   'main'        → normal assigned work only (My Tasks tab)
+//   'additional'  → additional / reassigned work only (Additional Tasks tab)
 //
 // Complete → row moves to Task Review (status "IN REVIEW").
 // Approved → COMPLETED and locked. Rework → RESTART continues the same timer.
@@ -72,6 +77,10 @@ class WorkspaceMyTasksSection extends StatefulWidget {
   /// Employee Workspace). When null the button explains where to go.
   final VoidCallback? onOpenDayPlanner;
 
+  /// 'main' hides additional / reassigned work, 'additional' shows only it,
+  /// null shows everything for the date.
+  final String? view;
+
   const WorkspaceMyTasksSection({
     super.key,
     required this.clientName,
@@ -79,6 +88,7 @@ class WorkspaceMyTasksSection extends StatefulWidget {
     required this.employeeName,
     required this.authToken,
     this.onOpenDayPlanner,
+    this.view,
   });
 
   @override
@@ -133,7 +143,8 @@ class _WorkspaceMyTasksSectionState extends State<WorkspaceMyTasksSection> {
   @override
   void didUpdateWidget(covariant WorkspaceMyTasksSection oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.clientName != widget.clientName ||
+    if (oldWidget.view != widget.view ||
+        oldWidget.clientName != widget.clientName ||
         oldWidget.submissionDate != widget.submissionDate ||
         oldWidget.employeeName != widget.employeeName) {
       _load();
@@ -223,12 +234,25 @@ class _WorkspaceMyTasksSectionState extends State<WorkspaceMyTasksSection> {
           })
           .toList();
       if (!mounted) return;
+
+      // Additional / reassigned work has its own tab.
+      bool isExtra(Map<String, dynamic> g) {
+        final k = '${g['key']}';
+        return k.startsWith('additional:') || k.startsWith('reassigned:');
+      }
+
+      final shown = widget.view == 'additional'
+          ? groups.where(isExtra).toList()
+          : widget.view == 'main'
+              ? groups.where((g) => !isExtra(g)).toList()
+              : groups;
+
       final previousKey = _groups.isNotEmpty && _selected < _groups.length
           ? _groups[_selected]['key']
           : null;
       setState(() {
-        _groups = groups;
-        final index = groups.indexWhere((g) => g['key'] == previousKey);
+        _groups = shown;
+        final index = shown.indexWhere((g) => g['key'] == previousKey);
         _selected = index < 0 ? 0 : index;
         _loading = false;
         _error = null;
@@ -704,13 +728,15 @@ class _WorkspaceMyTasksSectionState extends State<WorkspaceMyTasksSection> {
       );
     }
     if (_groups.isEmpty) {
-      return const Center(
+      return Center(
         child: Padding(
-          padding: EdgeInsets.all(24),
+          padding: const EdgeInsets.all(24),
           child: Text(
-            'No tasks are assigned to you for this client and submit date.',
+            widget.view == 'additional'
+                ? 'No additional tasks for this client and submit date.'
+                : 'No tasks are assigned to you for this client and submit date.',
             textAlign: TextAlign.center,
-            style: TextStyle(color: _kMuted),
+            style: const TextStyle(color: _kMuted),
           ),
         ),
       );

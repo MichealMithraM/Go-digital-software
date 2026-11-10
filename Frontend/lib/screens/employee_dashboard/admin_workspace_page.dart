@@ -1,4 +1,4 @@
-// GODIGITAL_ADMIN_COMPLETE_V12
+// GODIGITAL_ADMIN_COMPLETE_V13
 // lib/screens/employee_dashboard/admin_workspace_page.dart
 //
 // Main admin → Employee Workspace.
@@ -7,7 +7,8 @@
 //     Cards of the current month are highlighted.
 //   • Pending list: every task that broke a Task Deadline Rule.
 //   • Open a card → Employee Tasks (all team tasks, live: who is working),
-//     Content Calendar, Task Review, Live Tracking, Team Chat, Pending.
+//     Content Calendar, Additional Tasks, Task Review, Live Tracking,
+//     Team Chat, Pending, Client Details, Client Credentials.
 //
 // This file is a `part` of employee_workspace_page.dart so it can reuse the
 // client card, ribbons, header and team chat widgets.
@@ -89,6 +90,23 @@ class _AdminCard {
   String? get ribbon => isPastSubmitDate ? 'LATE' : client.ribbon;
 }
 
+/// One client = one card in the list; opening it shows ONLY the current card
+/// (nearest submit date today or later) and the previous card.
+class _AdminGroup {
+  final String key;
+  final String name;
+  final _AdminCard? current;
+  final _AdminCard? previous;
+  const _AdminGroup(this.key, this.name, this.current, this.previous);
+
+  _AdminCard get head => current ?? previous!;
+
+  List<(String, _AdminCard)> get cards => [
+    if (current != null) ('CURRENT', current!),
+    if (previous != null) ('PREVIOUS', previous!),
+  ];
+}
+
 _WorkspaceClient _clientFromAdminCard(Map<String, dynamic> card) {
   int n(dynamic v) => v is int ? v : int.tryParse('${v ?? 0}') ?? 0;
   final tasks = <_WorkspaceTask>[];
@@ -125,6 +143,14 @@ _WorkspaceClient _clientFromAdminCard(Map<String, dynamic> card) {
         inReviewCount: inReview,
         reworkCount: rework,
         awaitingHandoff: t['awaiting_handoff'] == true,
+        // Needs /workspace-tasks/admin/cards to send these per task.
+        isAdditional: t['is_additional'] == true,
+        handlerAssigned: t['handler_assigned'] == true,
+        assignedBy: [
+          '${t['assigned_by'] ?? ''}'.trim(),
+          if ('${t['assigned_by_role'] ?? ''}'.trim().isNotEmpty)
+            '(${t['assigned_by_role']})',
+        ].where((e) => e.isNotEmpty).join(' '),
       ),
     );
   }
@@ -135,6 +161,8 @@ _WorkspaceClient _clientFromAdminCard(Map<String, dynamic> card) {
     tasks: tasks,
     toReview: n(card['to_review']),
     assignedAt: DateTime.tryParse('${card['assigned_at'] ?? ''}')?.toLocal(),
+    package: '${card['package'] ?? ''}'.trim(),
+    maintenanceDay: '${card['maintenance_day'] ?? ''}'.trim(),
     team: (card['team'] as List? ?? [])
         .whereType<Map>()
         .map((t) => Map<String, dynamic>.from(t))
@@ -149,6 +177,8 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
   String? _error;
   int _tab = 0; // 0 = cards, 1 = pending list
   _AdminCard? _selected;
+  // Client whose submit-date cards are open (key = _clientKey(name)).
+  String? _openGroup;
   String _search = '';
   String _sort = 'current';
   String? _month;
@@ -207,17 +237,26 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
           'Cards: ${jsonDecode(responses[0].body)['message'] ?? responses[0].statusCode}',
         );
       }
-      final cards = <_AdminCard>[];
+      final clients = <_WorkspaceClient>[];
+      final lateByKey = <String, int>{};
       for (final raw
           in (jsonDecode(responses[0].body)['data'] as List? ?? [])
               .whereType<Map>()) {
         final card = Map<String, dynamic>.from(raw);
         final client = _clientFromAdminCard(card);
         if (client.tasks.isEmpty) continue;
-        cards.add(
-          _AdminCard(client, int.tryParse('${card['late'] ?? 0}') ?? 0),
-        );
+        clients.add(client);
+        lateByKey['${_clientKey(client.name)}|${_dayKey(client.submissionDate)}'] =
+            int.tryParse('${card['late'] ?? 0}') ?? 0;
       }
+      // Additional tasks join the client's current card (never a new card).
+      final cards = [
+        for (final c in _arrangeCards(clients))
+          _AdminCard(
+            c,
+            lateByKey['${_clientKey(c.name)}|${_dayKey(c.submissionDate)}'] ?? 0,
+          ),
+      ];
       final pending = responses[1].statusCode == 200
           ? (jsonDecode(responses[1].body)['data'] as List? ?? [])
                 .whereType<Map>()
@@ -277,6 +316,15 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
                           '${p['submission_date']}' ==
                               selected.client.submissionDate,
                     )
+                    .toList(),
+                // Every card of the same client (for the Additional Tasks tab).
+                relatedCards: _cards
+                    .where(
+                      (c) =>
+                          c.client.name.toLowerCase() ==
+                          selected.client.name.toLowerCase(),
+                    )
+                    .map((c) => c.client)
                     .toList(),
                 onBack: () => setState(() => _selected = null),
               )
@@ -531,9 +579,9 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
   String _monthKey(DateTime d) =>
       '${d.year}-${d.month.toString().padLeft(2, '0')}';
 
-  List<_AdminCard> _visible() {
+  List<_AdminCard> _visible(List<_AdminCard> source) {
     final q = _search.trim().toLowerCase();
-    final list = _cards.where((c) {
+    final list = source.where((c) {
       if (q.isNotEmpty &&
           !c.client.name.toLowerCase().contains(q) &&
           !c.client.team.any(
@@ -587,6 +635,149 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
     return list;
   }
 
+  /// Per client: ONLY the current card (nearest submit date today or later)
+  /// and the previous card (latest before today).
+  List<_AdminGroup> _buildGroups(List<_AdminCard> cards) {
+    final t = DateTime.now();
+    final today = DateTime(t.year, t.month, t.day);
+    DateTime due(_AdminCard c) => c.client.dueDate ?? DateTime(2100);
+    final byClient = <String, List<_AdminCard>>{};
+    for (final c in cards) {
+      (byClient[_clientKey(c.client.name)] ??= []).add(c);
+    }
+    final out = <_AdminGroup>[];
+    byClient.forEach((key, list) {
+      list.sort((a, b) => due(a).compareTo(due(b)));
+      final upcoming = list.where((c) => !due(c).isBefore(today)).toList();
+      final past = list.where((c) => due(c).isBefore(today)).toList();
+      out.add(
+        _AdminGroup(
+          key,
+          list.first.client.name,
+          upcoming.isEmpty ? null : upcoming.first,
+          past.isEmpty ? null : past.last,
+        ),
+      );
+    });
+    return out;
+  }
+
+  Widget _adminGroupView(_AdminGroup g) {
+    final head = g.head.client;
+    final maint = head.maintenanceDay.isNotEmpty
+        ? head.maintenanceDay
+        : (head.dueDate == null ? '' : '${head.dueDate!.day}');
+    final pkg = g.cards
+        .map((c) => c.$2.client.package)
+        .firstWhere((p) => p.isNotEmpty, orElse: () => '');
+    Color labelColor(String l) =>
+        l == 'CURRENT' ? const Color(0xFF15803D) : _aMuted;
+    Widget chip(IconData icon, String text) => Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFFEFF5FF),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xFFBFDBFE)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: _aBlue),
+          const SizedBox(width: 5),
+          Text(
+            text,
+            style: const TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w700,
+              color: _aBlue,
+            ),
+          ),
+        ],
+      ),
+    );
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 6, 20, 28),
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: _aLine),
+          ),
+          child: Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 10,
+            runSpacing: 8,
+            children: [
+              TextButton.icon(
+                onPressed: () => setState(() => _openGroup = null),
+                icon: const Icon(Icons.arrow_back_rounded, size: 17),
+                label: const Text('All clients'),
+              ),
+              Text(
+                g.name,
+                style: const TextStyle(
+                  color: _aInk,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 19,
+                ),
+              ),
+              if (maint.isNotEmpty)
+                chip(Icons.build_circle_outlined, 'Maintain date: $maint'),
+              if (pkg.isNotEmpty) chip(Icons.inventory_2_outlined, pkg),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        LayoutBuilder(
+          builder: (context, c) {
+            final w = c.maxWidth < 440 ? c.maxWidth : 420.0;
+            return Wrap(
+              spacing: 16,
+              runSpacing: 18,
+              children: [
+                for (final entry in g.cards)
+                  SizedBox(
+                    width: w,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          margin: const EdgeInsets.only(bottom: 6, left: 4),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: labelColor(entry.$1).withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(
+                            '${entry.$1} · ${_formatDate(entry.$2.client.submissionDate)}',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0.4,
+                              color: labelColor(entry.$1),
+                            ),
+                          ),
+                        ),
+                        SizedBox(
+                          height: 400,
+                          child: _adminCard(entry.$2, showMeta: false),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+
   Widget _cardsView() {
     const months = [
       'Jan',
@@ -623,13 +814,20 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
       'PENDING',
       'COMPLETED',
     ];
+    // One card per client; its current (or latest) card represents it.
+    final groups = _buildGroups(_cards);
+    final heads = groups.map((g) => g.head).toList();
     int countFor(String f) => switch (f) {
-      'ALL' => _cards.length,
-      'CURRENT' => _cards.where((c) => c.isCurrent).length,
-      'PENDING' => _cards.where((c) => c.ribbon == null).length,
-      _ => _cards.where((c) => c.ribbon == f).length,
+      'ALL' => heads.length,
+      'CURRENT' => heads.where((c) => c.isCurrent).length,
+      'PENDING' => heads.where((c) => c.ribbon == null).length,
+      _ => heads.where((c) => c.ribbon == f).length,
     };
-    final visible = _visible();
+    final visible = _visible(heads);
+    final openGroup = _openGroup == null
+        ? null
+        : groups.where((g) => g.key == _openGroup).firstOrNull;
+    if (openGroup != null) return _adminGroupView(openGroup);
     InputDecoration deco(String label, {Widget? prefix}) => InputDecoration(
       labelText: label,
       prefixIcon: prefix,
@@ -852,7 +1050,15 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
                     final card = visible[index];
                     return Padding(
                       padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-                      child: SizedBox(height: 440, child: _adminCard(card)),
+                      child: SizedBox(
+                        height: 460,
+                        child: _adminCard(
+                          card,
+                          onOpen: () => setState(
+                            () => _openGroup = _clientKey(card.client.name),
+                          ),
+                        ),
+                      ),
                     );
                   }, childCount: visible.length),
                 ),
@@ -893,10 +1099,15 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
                           crossAxisCount: columns,
                           crossAxisSpacing: 16,
                           mainAxisSpacing: 16,
-                          mainAxisExtent: 364,
+                          mainAxisExtent: 388,
                         ),
                         itemCount: visible.length,
-                        itemBuilder: (context, i) => _adminCard(visible[i]),
+                        itemBuilder: (context, i) => _adminCard(
+                          visible[i],
+                          onOpen: () => setState(
+                            () => _openGroup = _clientKey(visible[i].client.name),
+                          ),
+                        ),
                       );
                     },
                   ),
@@ -906,7 +1117,11 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
     );
   }
 
-  Widget _adminCard(_AdminCard card) {
+  Widget _adminCard(
+    _AdminCard card, {
+    VoidCallback? onOpen,
+    bool showMeta = true,
+  }) {
     final running = card.client.inProgress;
     Widget tag(String text, Color bg, Color fg, IconData icon) => Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
@@ -978,7 +1193,8 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
               ribbon: card.ribbon,
               child: _ClientCard(
                 client: card.client,
-                onOpen: () => setState(() => _selected = card),
+                showMeta: showMeta,
+                onOpen: onOpen ?? () => setState(() => _selected = card),
               ),
             ),
           ),
@@ -997,6 +1213,8 @@ class _AdminClientView extends StatefulWidget {
   final int adminId;
   final String token;
   final List<Map<String, dynamic>> pending;
+  // All cards of this client (every submit date) — feeds Additional Tasks.
+  final List<_WorkspaceClient> relatedCards;
   final VoidCallback onBack;
 
   const _AdminClientView({
@@ -1006,6 +1224,7 @@ class _AdminClientView extends StatefulWidget {
     required this.adminId,
     required this.token,
     required this.pending,
+    required this.relatedCards,
     required this.onBack,
   });
 
@@ -1085,6 +1304,29 @@ class _AdminClientViewState extends State<_AdminClientView> {
     }
   }
 
+  // When this cycle started: the previous card's submit date for this client,
+  // or one month before this card's submit date when there is no earlier card.
+  ({DateTime? date, String note}) _cycleStart() {
+    final due = client.dueDate;
+    if (due == null) return (date: null, note: '');
+    DateTime? prev;
+    for (final c in widget.relatedCards) {
+      final d = c.dueDate;
+      if (d == null || !d.isBefore(due)) continue;
+      if (prev == null || d.isAfter(prev)) prev = d;
+    }
+    if (prev != null) return (date: prev, note: 'Previous cycle date');
+    final lastDayPrevMonth = DateTime(due.year, due.month, 0).day;
+    return (
+      date: DateTime(
+        due.year,
+        due.month - 1,
+        due.day > lastDayPrevMonth ? lastDayPrevMonth : due.day,
+      ),
+      note: 'Cycle start (1 month before submit)',
+    );
+  }
+
   Future<void> _load({bool silent = false}) async {
     if (!silent) setState(() => _loading = true);
     try {
@@ -1151,6 +1393,9 @@ class _AdminClientViewState extends State<_AdminClientView> {
   @override
   Widget build(BuildContext context) {
     final lateItems = _compliance.where((c) => c['status'] == 'LATE').toList();
+    final additionalCount = client.tasks
+        .where((t) => t.isAdditional || t.handlerAssigned)
+        .length;
     final tabs = <(String, IconData, int)>[
       (
         'Employee Tasks',
@@ -1158,6 +1403,7 @@ class _AdminClientViewState extends State<_AdminClientView> {
         _allRows().where((r) => r['state'] == 'IN PROGRESS').length,
       ),
       ('Content Calendar', Icons.calendar_month_rounded, 0),
+      ('Additional Tasks', Icons.add_task_rounded, additionalCount),
       (
         'Task Review',
         Icons.fact_check_rounded,
@@ -1166,6 +1412,8 @@ class _AdminClientViewState extends State<_AdminClientView> {
       ('Live Tracking', Icons.timer_rounded, 0),
       ('Team Chat', Icons.forum_rounded, 0),
       ('Pending', Icons.pending_actions_rounded, lateItems.length),
+      ('Client Details', Icons.badge_rounded, 0),
+      ('Client Credentials', Icons.key_rounded, 0),
     ];
     return DefaultTabController(
       length: tabs.length,
@@ -1274,6 +1522,9 @@ class _AdminClientViewState extends State<_AdminClientView> {
                           readOnly: true,
                         ),
                       ),
+                      _WorkspaceTabKeepAlive(
+                        child: _AdminAdditionalTable(cards: [client]),
+                      ),
                       // Main admin: Approve / Pending / Rework / Reject any row.
                       _WorkspaceTabKeepAlive(
                         child: WorkspaceTaskReviewSection(
@@ -1300,6 +1551,20 @@ class _AdminClientViewState extends State<_AdminClientView> {
                           items: _compliance,
                           showClient: false,
                           showAll: true,
+                        ),
+                      ),
+                      _WorkspaceTabKeepAlive(
+                        child: _AdminClientDetailsTab(
+                          client: client,
+                          token: widget.token,
+                          cycleStart: _cycleStart().date,
+                          cycleNote: _cycleStart().note,
+                        ),
+                      ),
+                      _WorkspaceTabKeepAlive(
+                        child: _AdminClientCredentialsTab(
+                          clientName: client.name,
+                          token: widget.token,
                         ),
                       ),
                     ],
@@ -1883,6 +2148,1304 @@ class _AdminClientViewState extends State<_AdminClientView> {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
       children: live,
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared helpers for the Client Details / Credentials tabs
+// ─────────────────────────────────────────────────────────────────────────────
+Future<Map<String, dynamic>?> _findClientRecord(
+  String name,
+  String token,
+) async {
+  final res = await http.get(
+    Uri.parse('${ApiConfig.baseUrl}/clients/all-for-credentials'),
+    headers: {if (token.isNotEmpty) 'Authorization': 'Bearer $token'},
+  );
+  if (res.statusCode != 200) return null;
+  final list = (jsonDecode(res.body)['data'] as List? ?? []).whereType<Map>();
+  final wanted = name.trim().toLowerCase();
+  for (final c in list) {
+    final n1 = '${c['company_name'] ?? ''}'.trim().toLowerCase();
+    final n2 = '${c['client_name'] ?? ''}'.trim().toLowerCase();
+    if (n1 == wanted || n2 == wanted) {
+      return Map<String, dynamic>.from(c);
+    }
+  }
+  return null;
+}
+
+String _pick(Map<String, dynamic>? m, List<String> keys) {
+  for (final k in keys) {
+    final v = '${m?[k] ?? ''}'.trim();
+    if (v.isNotEmpty && v != 'null') return v;
+  }
+  return '';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional tasks table (all additional / handler-assigned tasks of a client)
+// ─────────────────────────────────────────────────────────────────────────────
+class _AdminAdditionalTable extends StatelessWidget {
+  final List<_WorkspaceClient> cards;
+  const _AdminAdditionalTable({required this.cards});
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = <(_WorkspaceClient, _WorkspaceTask)>[
+      for (final c in cards)
+        for (final t in c.tasks)
+          if (t.isAdditional || t.handlerAssigned) (c, t),
+    ];
+    if (rows.isEmpty) {
+      return const Center(
+        child: Text(
+          'No additional tasks for this client.',
+          style: TextStyle(color: _aMuted),
+        ),
+      );
+    }
+    const h = TextStyle(
+      fontSize: 11,
+      fontWeight: FontWeight.w900,
+      color: _aMuted,
+    );
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+      children: [
+        Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: _aLine),
+          ),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.all(12),
+            child: DataTable(
+              headingRowHeight: 38,
+              columns: const [
+                DataColumn(label: Text('TASK', style: h)),
+                DataColumn(label: Text('EMPLOYEE', style: h)),
+                DataColumn(label: Text('ASSIGNED BY', style: h)),
+                DataColumn(label: Text('SUBMIT DATE', style: h)),
+                DataColumn(label: Text('STATUS', style: h)),
+                DataColumn(label: Text('DONE', style: h)),
+              ],
+              rows: [
+                for (final (c, t) in rows)
+                  DataRow(
+                    cells: [
+                      DataCell(
+                        Text(
+                          t.name,
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      DataCell(Text(t.employee.isEmpty ? '—' : t.employee)),
+                      DataCell(
+                        Text(t.assignedBy.isEmpty ? 'Admin' : t.assignedBy),
+                      ),
+                      DataCell(Text(_formatDate(c.submissionDate))),
+                      DataCell(
+                        Text(
+                          _statusLabel(t.status),
+                          style: TextStyle(
+                            color: _statusColor(t.status),
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                      DataCell(Text('${t.completedCount}/${t.total}')),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Client Details: start date, completed months, maintain date, submit date,
+// package and the tasks available.
+// ─────────────────────────────────────────────────────────────────────────────
+class _AdminClientDetailsTab extends StatefulWidget {
+  final _WorkspaceClient client;
+  final String token;
+  // When this cycle started: the previous cycle's submit date, or one month
+  // before this card's submit date when there is no earlier card.
+  final DateTime? cycleStart;
+  final String cycleNote;
+  const _AdminClientDetailsTab({
+    required this.client,
+    required this.token,
+    this.cycleStart,
+    this.cycleNote = '',
+  });
+
+  @override
+  State<_AdminClientDetailsTab> createState() => _AdminClientDetailsTabState();
+}
+
+class _AdminClientDetailsTabState extends State<_AdminClientDetailsTab> {
+  static const _packageKeys = [
+    'package_name',
+    'packageName',
+    'package',
+    'package_type',
+    'packageType',
+    'packages',
+    'package_title',
+    'selected_package',
+    'service_package',
+    'plan',
+    'plan_name',
+  ];
+
+  Map<String, dynamic>? _record;
+  Map<String, dynamic>? _package;
+  String _packageNote = '';
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  String _norm(String s) => s
+      .toLowerCase()
+      .replaceAll(RegExp(r'\(\s*\d+\s*\)'), '')
+      .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
+      .trim();
+
+  // Package whose task list overlaps the client's own tasks the most.
+  Map<String, dynamic>? _bestByTasks(List<Map<String, dynamic>> packages) {
+    final mine = widget.client.tasks
+        .where((t) => !t.isAdditional && !t.handlerAssigned)
+        .map((t) => _norm(t.name))
+        .where((n) => n.isNotEmpty && !n.startsWith('content calendar'))
+        .toList();
+    if (mine.isEmpty) return null;
+    Map<String, dynamic>? best;
+    var bestOverlap = 0;
+    var bestScore = 0.0;
+    for (final p in packages) {
+      final pt = (p['package_tasks'] as List? ?? [])
+          .map((e) => _norm('$e'))
+          .where((e) => e.isNotEmpty)
+          .toList();
+      if (pt.isEmpty) continue;
+      final overlap = pt
+          .where(
+            (x) => mine.any((m) => m == x || m.contains(x) || x.contains(m)),
+          )
+          .length;
+      final score = overlap / pt.length;
+      if (overlap >= 1 &&
+          score >= 0.5 &&
+          (overlap > bestOverlap ||
+              (overlap == bestOverlap && score > bestScore))) {
+        best = p;
+        bestOverlap = overlap;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  Future<void> _load() async {
+    try {
+      final rec = await _findClientRecord(widget.client.name, widget.token);
+      var packages = <Map<String, dynamic>>[];
+      try {
+        final res = await http.get(Uri.parse('${ApiConfig.baseUrl}/packages'));
+        if (res.statusCode == 200) {
+          packages = (jsonDecode(res.body)['data'] as List? ?? [])
+              .whereType<Map>()
+              .map((p) => Map<String, dynamic>.from(p))
+              .toList();
+        }
+      } catch (_) {}
+
+      Map<String, dynamic>? pkg;
+      var note = '';
+      final idRaw = _pick(rec, ['package_id', 'packageId']);
+      final nameRaw = _pick(rec, _packageKeys).toLowerCase();
+      if (idRaw.isNotEmpty) {
+        for (final p in packages) {
+          if ('${p['id']}' == idRaw) {
+            pkg = p;
+            break;
+          }
+        }
+      }
+      if (pkg == null && nameRaw.isNotEmpty) {
+        for (final p in packages) {
+          final title = '${p['title'] ?? ''}'.toLowerCase();
+          if (title.isNotEmpty &&
+              (nameRaw.contains(title) || title.contains(nameRaw))) {
+            pkg = p;
+            break;
+          }
+        }
+      }
+      if (pkg == null && nameRaw.isEmpty && idRaw.isEmpty) {
+        pkg = _bestByTasks(packages);
+        if (pkg != null) {
+          note = 'Matched from this client’s tasks (no package saved on the client record).';
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _record = rec;
+        _package = pkg;
+        _packageNote = note;
+        _loading = false;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  String _date(DateTime? d) =>
+      d == null ? '—' : DateFormat('d MMM yyyy').format(d);
+
+  // Days left until the card's submit date.
+  (String, Color)? _daysLeft() {
+    final due = widget.client.dueDate;
+    if (due == null) return null;
+    final n = DateTime.now();
+    final diff = due.difference(DateTime(n.year, n.month, n.day)).inDays;
+    if (diff > 1) {
+      return (
+        '$diff days left',
+        diff <= 3 ? const Color(0xFFEA580C) : const Color(0xFF15803D),
+      );
+    }
+    if (diff == 1) return ('1 day left', const Color(0xFFEA580C));
+    if (diff == 0) return ('Due today', const Color(0xFFEA580C));
+    return ('${-diff} day${diff == -1 ? '' : 's'} overdue', _aLate);
+  }
+
+  Widget _tile(
+    String label,
+    String value,
+    IconData icon, {
+    String? sub,
+    Color? subColor,
+  }) => Container(
+    width: 240,
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: _aLine),
+    ),
+    child: Row(
+      children: [
+        Icon(icon, color: _aBlue, size: 20),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w800,
+                  color: _aMuted,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                value.isEmpty ? '—' : value,
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w800,
+                  color: _aInk,
+                ),
+              ),
+              if (sub != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    sub,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: subColor == null
+                          ? FontWeight.w500
+                          : FontWeight.w800,
+                      color: subColor ?? _aMuted,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _card({required String title, required Widget child}) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(14),
+      border: Border.all(color: _aLine),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w900,
+            color: _aMuted,
+          ),
+        ),
+        const SizedBox(height: 10),
+        child,
+      ],
+    ),
+  );
+
+  Widget _tasksCard() {
+    final tasks = widget.client.tasks;
+    final pkgTasks = _package?['package_tasks'] as List? ?? [];
+    return _card(
+      title: 'TASKS AVAILABLE',
+      child: (tasks.isEmpty && pkgTasks.isEmpty)
+          ? const Text('No tasks available.', style: TextStyle(color: _aMuted))
+          : Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final t in tasks)
+                  Chip(
+                    label: Text('${t.name} · ${t.completedCount}/${t.total}'),
+                  ),
+                for (final p in pkgTasks)
+                  Chip(
+                    label: Text('$p'),
+                    backgroundColor: const Color(0xFFEFF6FF),
+                  ),
+              ],
+            ),
+    );
+  }
+
+  Widget _packageCard(String recordName) {
+    final pkg = _package;
+    final features = (pkg?['features'] as List? ?? []);
+    final title = '${pkg?['title'] ?? ''}'.trim().isNotEmpty
+        ? '${pkg!['title']}'
+        : recordName;
+    return _card(
+      title: 'PACKAGE DETAILS',
+      child: (title.isEmpty && pkg == null)
+          ? const Text(
+              'No package linked to this client.',
+              style: TextStyle(color: _aMuted),
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.inventory_2_outlined,
+                      color: _aBlue,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w900,
+                          color: _aInk,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                if (_packageNote.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    _packageNote,
+                    style: const TextStyle(
+                      fontSize: 10.5,
+                      color: _aMuted,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ],
+                if ('${pkg?['subtitle'] ?? ''}'.trim().isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    '${pkg!['subtitle']}',
+                    style: const TextStyle(fontSize: 12, color: _aMuted),
+                  ),
+                ],
+                if ('${pkg?['price'] ?? ''}'.trim().isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    '${pkg!['price']} ${pkg['period'] ?? ''}'.trim(),
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w900,
+                      color: _aBlue,
+                    ),
+                  ),
+                ],
+                if (features.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  for (final f in features)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 3),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(
+                            Icons.check_circle_rounded,
+                            size: 15,
+                            color: Color(0xFF16A34A),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              '$f',
+                              style: const TextStyle(
+                                fontSize: 12.5,
+                                color: _aInk,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ],
+            ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const Center(child: CircularProgressIndicator());
+    // MAINTAIN DATE = the day of the month work is submitted (e.g. 12).
+    final maintainRaw = _pick(_record, [
+      'maintenance_date',
+      'maintenanceDate',
+      'maintain_date',
+      'maintainDate',
+    ]);
+    final maintainDay =
+        (DateTime.tryParse(maintainRaw.replaceFirst(' ', 'T')) ??
+                DateTime.tryParse(widget.client.submissionDate))
+            ?.day;
+    final recordPackage = _pick(_record, _packageKeys);
+    final left = _daysLeft();
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+      children: [
+        Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          children: [
+            _tile(
+              'START DATE',
+              _date(widget.cycleStart),
+              Icons.play_circle_outline_rounded,
+              sub: widget.cycleNote.isEmpty ? null : widget.cycleNote,
+            ),
+            _tile(
+              'MAINTAIN DATE',
+              maintainDay == null ? '—' : '$maintainDay',
+              Icons.build_circle_outlined,
+              sub: maintainDay == null ? null : 'of every month',
+            ),
+            _tile(
+              'SUBMIT DATE',
+              _formatDate(widget.client.submissionDate),
+              Icons.event_rounded,
+              sub: left?.$1,
+              subColor: left?.$2,
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        LayoutBuilder(
+          builder: (context, c) {
+            // Wide: tasks take the left + centre columns, package the right one.
+            if (c.maxWidth >= 900) {
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(flex: 2, child: _tasksCard()),
+                  const SizedBox(width: 14),
+                  Expanded(child: _packageCard(recordPackage)),
+                ],
+              );
+            }
+            return Column(
+              children: [
+                _tasksCard(),
+                const SizedBox(height: 14),
+                _packageCard(recordPackage),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Client Credentials — the full credentials workspace for THIS client:
+// view, add, edit, show/hide password and history. Delete is not offered here.
+// ─────────────────────────────────────────────────────────────────────────────
+class _AdminClientCredentialsTab extends StatefulWidget {
+  final String clientName;
+  final String token;
+  const _AdminClientCredentialsTab({
+    required this.clientName,
+    required this.token,
+  });
+
+  @override
+  State<_AdminClientCredentialsTab> createState() =>
+      _AdminClientCredentialsTabState();
+}
+
+class _AdminClientCredentialsTabState
+    extends State<_AdminClientCredentialsTab> {
+  static const _basePlatforms = [
+    'Facebook',
+    'Instagram',
+    'YouTube',
+    'Google Ads',
+    'Meta Ads',
+    'LinkedIn',
+    'WhatsApp Business',
+    'Mail id',
+    'Google Business Profile',
+    'Server Login',
+  ];
+
+  int? _clientId;
+  List<Map<String, dynamic>> _items = [];
+  final Set<int> _shown = {};
+  bool _loading = true;
+  bool _saving = false;
+  String? _error;
+
+  int? _editingId;
+  String _platform = 'Select';
+  bool _showPassword = false;
+  final _other = TextEditingController();
+  final _user = TextEditingController();
+  final _pass = TextEditingController();
+  final _phone = TextEditingController();
+  final _email = TextEditingController();
+
+  Map<String, String> get _headers => {
+    'Content-Type': 'application/json',
+    if (widget.token.isNotEmpty) 'Authorization': 'Bearer ${widget.token}',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _other.dispose();
+    _user.dispose();
+    _pass.dispose();
+    _phone.dispose();
+    _email.dispose();
+    super.dispose();
+  }
+
+  void _snack(String message, {bool ok = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: ok ? const Color(0xFF16A34A) : const Color(0xFFDC2626),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Future<void> _load() async {
+    try {
+      final rec = await _findClientRecord(widget.clientName, widget.token);
+      final id = int.tryParse('${rec?['id'] ?? ''}');
+      if (id == null) throw Exception('Client record not found');
+      _clientId = id;
+      await _fetch();
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e'.replaceFirst('Exception: ', '');
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _fetch() async {
+    final res = await http.get(
+      Uri.parse('${ApiConfig.baseUrl}/credentials?clientId=$_clientId'),
+      headers: _headers,
+    );
+    if (res.statusCode != 200) throw Exception('Server ${res.statusCode}');
+    final list = (jsonDecode(res.body)['data'] as List? ?? [])
+        .whereType<Map>()
+        .map((m) => Map<String, dynamic>.from(m))
+        .toList();
+    if (!mounted) return;
+    setState(() => _items = list);
+  }
+
+  void _clear() {
+    setState(() {
+      _editingId = null;
+      _platform = 'Select';
+      _showPassword = false;
+      _other.clear();
+      _user.clear();
+      _pass.clear();
+      _phone.clear();
+      _email.clear();
+    });
+  }
+
+  void _edit(Map<String, dynamic> c) {
+    final platform = '${c['platform'] ?? ''}';
+    final custom = platform.isNotEmpty && !_basePlatforms.contains(platform);
+    setState(() {
+      _editingId = int.tryParse('${c['id']}');
+      _platform = custom ? 'Others' : platform;
+      _other.text = custom ? platform : '';
+      _user.text = '${c['username'] ?? ''}';
+      _pass.text = '${c['password'] ?? ''}';
+      _phone.text = '${c['contact_number'] ?? ''}';
+      _email.text = '${c['email'] ?? ''}';
+      _showPassword = false;
+    });
+  }
+
+  Future<void> _save() async {
+    final platform = _platform == 'Others' ? _other.text.trim() : _platform;
+    if (platform.isEmpty || platform == 'Select') {
+      return _snack('Please select a platform');
+    }
+    if (_user.text.trim().isEmpty) return _snack('Please enter username');
+    if (_pass.text.trim().isEmpty) return _snack('Please enter password');
+    if (_clientId == null) return _snack('Client record not found');
+
+    setState(() => _saving = true);
+    try {
+      final payload = {
+        'username': _user.text.trim(),
+        'password': _pass.text.trim(),
+        'platform': platform,
+        'contactNumber': _phone.text.trim(),
+        'email': _email.text.trim(),
+      };
+      final editing = _editingId != null;
+      final res = editing
+          ? await http.put(
+              Uri.parse('${ApiConfig.baseUrl}/credentials/$_editingId'),
+              headers: _headers,
+              body: jsonEncode(payload),
+            )
+          : await http.post(
+              Uri.parse('${ApiConfig.baseUrl}/credentials'),
+              headers: _headers,
+              body: jsonEncode({'clientId': _clientId, ...payload}),
+            );
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        _snack(
+          editing ? 'Credential updated' : 'Credential added',
+          ok: true,
+        );
+        _clear();
+        await _fetch();
+      } else {
+        var msg = editing ? 'Failed to update credential' : 'Failed to add credential';
+        try {
+          msg = '${jsonDecode(res.body)['message'] ?? msg}';
+        } catch (_) {}
+        _snack(msg);
+      }
+    } catch (_) {
+      _snack('Cannot connect to server');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  // ── History (created / edited / employee-deleted) ──
+  Map<String, dynamic> _changes(dynamic raw) {
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    if (raw is String && raw.isNotEmpty) {
+      try {
+        final p = jsonDecode(raw);
+        if (p is Map) return Map<String, dynamic>.from(p);
+      } catch (_) {}
+    }
+    return {};
+  }
+
+  String _hDate(dynamic v) {
+    final d = DateTime.tryParse('${v ?? ''}'.replaceFirst(' ', 'T'));
+    return d == null ? '—' : DateFormat('d MMM yyyy, h:mm a').format(d.toLocal());
+  }
+
+  Widget _historyList(List entries, String kind) {
+    if (entries.isEmpty) {
+      return const Center(
+        child: Text('Nothing recorded.', style: TextStyle(color: _aMuted)),
+      );
+    }
+    return ListView(
+      padding: const EdgeInsets.all(14),
+      children: [
+        for (final e in entries.whereType<Map>())
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: _aLine),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${e['actor_name'] ?? 'Unknown user'}'
+                  '${'${e['actor_type'] ?? ''}'.isEmpty ? '' : ' (${e['actor_type']})'}',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 13,
+                    color: _aInk,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _hDate(kind == 'deletions' ? e['hidden_at'] : e['created_at']),
+                  style: const TextStyle(fontSize: 11, color: _aMuted),
+                ),
+                const SizedBox(height: 8),
+                if (kind == 'deletions')
+                  Text(
+                    'Reason: ${e['reason'] ?? 'Not provided'}',
+                    style: const TextStyle(fontSize: 12),
+                  )
+                else if (kind == 'creations')
+                  Text(
+                    'Platform: ${_changes(e['changes_json'])['platform'] ?? '—'}',
+                    style: const TextStyle(fontSize: 12),
+                  )
+                else
+                  for (final c in _changes(e['changes_json']).entries)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 6),
+                      child: c.key == 'password'
+                          ? const Text(
+                              'Password changed (values hidden)',
+                              style: TextStyle(fontSize: 12),
+                            )
+                          : Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  c.key.replaceAll('_', ' '),
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                Text(
+                                  'Before: ${c.value is Map ? (c.value as Map)['old'] ?? '—' : '—'}',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                                Text(
+                                  'After: ${c.value is Map ? (c.value as Map)['new'] ?? '—' : '—'}',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                              ],
+                            ),
+                    ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  Future<void> _showHistory(int id, String platform) async {
+    final future = () async {
+      final res = await http.get(
+        Uri.parse('${ApiConfig.baseUrl}/credential-history/$id'),
+        headers: _headers,
+      );
+      final body = jsonDecode(res.body);
+      if (res.statusCode != 200 || body['success'] != true) {
+        throw Exception(body['message'] ?? 'Unable to load history');
+      }
+      return Map<String, dynamic>.from(body['data'] as Map);
+    }();
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 620, maxHeight: 620),
+          child: DefaultTabController(
+            length: 3,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 16, 8, 4),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.history_rounded, color: _aBlue),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Credential History · $platform',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        icon: const Icon(Icons.close_rounded),
+                      ),
+                    ],
+                  ),
+                ),
+                const TabBar(
+                  tabs: [
+                    Tab(text: 'Created'),
+                    Tab(text: 'Edit History'),
+                    Tab(text: 'Delete History'),
+                  ],
+                ),
+                Flexible(
+                  child: SizedBox(
+                    height: 400,
+                    child: FutureBuilder<Map<String, dynamic>>(
+                      future: future,
+                      builder: (context, snap) {
+                        if (snap.connectionState != ConnectionState.done) {
+                          return const Center(
+                            child: CircularProgressIndicator(),
+                          );
+                        }
+                        if (snap.hasError) {
+                          return Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(20),
+                              child: Text(
+                                '${snap.error}'.replaceFirst('Exception: ', ''),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          );
+                        }
+                        final d = snap.data ?? {};
+                        return TabBarView(
+                          children: [
+                            _historyList(d['creations'] as List? ?? [], 'creations'),
+                            _historyList(d['edits'] as List? ?? [], 'edits'),
+                            _historyList(d['deletions'] as List? ?? [], 'deletions'),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── UI ──
+  InputDecoration _deco(String label, IconData icon, {String? hint}) =>
+      InputDecoration(
+        labelText: label,
+        hintText: hint,
+        prefixIcon: Icon(icon, size: 18),
+        isDense: true,
+        filled: true,
+        fillColor: const Color(0xFFF8FAFC),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+      );
+
+  Widget _list(BuildContext context) {
+    if (_items.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(28),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: _aLine),
+        ),
+        child: const Center(
+          child: Text(
+            'No credentials saved for this client yet.\nUse the form to add the first one.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: _aMuted),
+          ),
+        ),
+      );
+    }
+    return Column(
+      children: [
+        for (final c in _items)
+          Builder(
+            builder: (_) {
+              final id = int.tryParse('${c['id']}') ?? 0;
+              final show = _shown.contains(id);
+              final pw = '${c['password'] ?? ''}';
+              final editing = _editingId == id;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: editing ? const Color(0xFFEFF6FF) : Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: editing ? _aBlue : _aLine),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.public_outlined, color: _aBlue, size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      flex: 3,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${c['platform'] ?? ''}',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w800,
+                              color: _aInk,
+                            ),
+                          ),
+                          SelectableText(
+                            '${c['username'] ?? ''}',
+                            style: const TextStyle(fontSize: 12, color: _aMuted),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Expanded(
+                      flex: 3,
+                      child: Row(
+                        children: [
+                          Flexible(
+                            child: SelectableText(
+                              show ? pw : '•' * (pw.length.clamp(1, 12)),
+                              style: const TextStyle(fontSize: 12.5),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: show ? 'Hide password' : 'Show password',
+                            icon: Icon(
+                              show
+                                  ? Icons.visibility_rounded
+                                  : Icons.visibility_off_rounded,
+                              size: 18,
+                            ),
+                            onPressed: () => setState(
+                              () => show ? _shown.remove(id) : _shown.add(id),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Expanded(
+                      flex: 3,
+                      child: Text(
+                        '${c['contact_number'] ?? ''}\n${c['email'] ?? ''}'.trim(),
+                        style: const TextStyle(fontSize: 11.5, color: _aMuted),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Edit',
+                      icon: const Icon(Icons.edit_outlined, size: 18, color: _aBlue),
+                      onPressed: () => _edit(c),
+                    ),
+                    IconButton(
+                      tooltip: 'History',
+                      icon: const Icon(
+                        Icons.history_rounded,
+                        size: 19,
+                        color: Color(0xFF0F766E),
+                      ),
+                      onPressed: () => _showHistory(id, '${c['platform'] ?? ''}'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+      ],
+    );
+  }
+
+  Widget _form() {
+    final editing = _editingId != null;
+    final used = _items
+        .map((c) => '${c['platform'] ?? ''}'.trim().toLowerCase())
+        .where((p) => p.isNotEmpty)
+        .toSet();
+    String? currentPlatform;
+    if (editing) {
+      for (final c in _items) {
+        if (int.tryParse('${c['id']}') == _editingId) {
+          currentPlatform = '${c['platform'] ?? ''}'.trim().toLowerCase();
+        }
+      }
+    }
+    final platforms = <String>[
+      'Select',
+      ..._basePlatforms.where((p) {
+        final n = p.toLowerCase();
+        return n == currentPlatform || !used.contains(n);
+      }),
+      'Others',
+    ];
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _aLine),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                editing ? Icons.edit_outlined : Icons.add_link_rounded,
+                color: _aBlue,
+                size: 20,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  editing ? 'Edit credential' : 'Add credential',
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w900,
+                    color: _aInk,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            widget.clientName,
+            style: const TextStyle(fontSize: 11.5, color: _aMuted),
+          ),
+          const SizedBox(height: 14),
+          DropdownButtonFormField<String>(
+            key: ValueKey('plat-$_editingId-${platforms.length}'),
+            initialValue: platforms.contains(_platform) ? _platform : 'Select',
+            isExpanded: true,
+            decoration: _deco('Platform *', Icons.language_outlined),
+            items: [
+              for (final p in platforms)
+                DropdownMenuItem(value: p, child: Text(p)),
+            ],
+            onChanged: (v) => setState(() => _platform = v ?? 'Select'),
+          ),
+          if (_platform == 'Others') ...[
+            const SizedBox(height: 10),
+            TextField(
+              controller: _other,
+              decoration: _deco(
+                'Platform name',
+                Icons.edit_outlined,
+                hint: 'e.g. Pinterest, Twitter/X',
+              ),
+            ),
+          ],
+          const SizedBox(height: 10),
+          TextField(
+            controller: _user,
+            decoration: _deco('User name *', Icons.person_outline),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _pass,
+            obscureText: !_showPassword,
+            decoration: _deco('Password *', Icons.lock_outline_rounded).copyWith(
+              suffixIcon: IconButton(
+                icon: Icon(
+                  _showPassword
+                      ? Icons.visibility_rounded
+                      : Icons.visibility_off_rounded,
+                  size: 18,
+                ),
+                onPressed: () => setState(() => _showPassword = !_showPassword),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _phone,
+            keyboardType: TextInputType.phone,
+            decoration: _deco('Contact number', Icons.phone_outlined),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _email,
+            keyboardType: TextInputType.emailAddress,
+            decoration: _deco('Email', Icons.email_outlined),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _saving ? null : _clear,
+                  child: Text(editing ? 'Cancel edit' : 'Clear'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: FilledButton.icon(
+                  onPressed: _saving ? null : _save,
+                  icon: _saving
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : Icon(
+                          editing ? Icons.save_outlined : Icons.add_rounded,
+                          size: 17,
+                        ),
+                  label: Text(editing ? 'Save changes' : 'Save credential'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const Center(child: CircularProgressIndicator());
+    if (_error != null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_error!, style: const TextStyle(color: _aMuted)),
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: () {
+                setState(() {
+                  _loading = true;
+                  _error = null;
+                });
+                _load();
+              },
+              child: const Text('Try again'),
+            ),
+          ],
+        ),
+      );
+    }
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                '${_items.length} credential${_items.length == 1 ? '' : 's'} saved',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: _aMuted,
+                ),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Refresh',
+              icon: const Icon(Icons.refresh_rounded, color: _aMuted),
+              onPressed: () async {
+                try {
+                  await _fetch();
+                } catch (_) {
+                  _snack('Unable to load credentials');
+                }
+              },
+            ),
+          ],
+        ),
+        LayoutBuilder(
+          builder: (context, c) {
+            if (c.maxWidth >= 900) {
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(flex: 3, child: _list(context)),
+                  const SizedBox(width: 14),
+                  SizedBox(width: 360, child: _form()),
+                ],
+              );
+            }
+            return Column(
+              children: [_list(context), const SizedBox(height: 14), _form()],
+            );
+          },
+        ),
+      ],
     );
   }
 }

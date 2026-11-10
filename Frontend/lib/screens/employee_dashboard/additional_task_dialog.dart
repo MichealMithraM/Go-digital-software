@@ -1,9 +1,10 @@
 // lib/screens/employee_dashboard/additional_task_dialog.dart
 //
 // Page / Ads Handler → Employee Workspace → "Add Additional Task".
-// Pick an active client, a deliverable (or "Other" + a name), the date and
-// how many rows. Saves through POST /workspace-tasks/additional-task and the
-// new card shows in Employee Workspace with the ADDITIONAL TASK ribbon.
+// Pick an active client, a deliverable (or "Other" + a name) and how many
+// rows. There is no submit date: the task joins the client's CURRENT card
+// (the deadline set in Tasks Assign) and shows in that card's
+// "Additional Tasks" tab. Saves through POST /workspace-tasks/additional-task.
 //
 // Returns the created task ({client, due_date, deliverable, rows, section})
 // or null when cancelled.
@@ -69,7 +70,6 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
   List<_ClientOption> _clients = [];
   String? _client;
   String? _deliverable;
-  DateTime? _date;
   int _count = 1;
 
   Map<String, String> get _headers => {
@@ -113,6 +113,8 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
                 '${c['name'] ?? ''}',
                 List<String>.from((c['deliverables'] as List? ?? []).map((e) => '$e')),
                 List<String>.from((c['assigned'] as List? ?? []).map((e) => '$e')),
+                '${c['card_date'] ?? ''}',
+                c.containsKey('card_date'),
               ))
           .where((c) => c.name.isNotEmpty)
           .toList();
@@ -142,28 +144,19 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
     return null;
   }
 
-  Future<void> _pickDate() async {
-    final today = DateUtils.dateOnly(DateTime.now());
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _date ?? today,
-      firstDate: today,
-      lastDate: today.add(const Duration(days: 365)),
-      helpText: 'Submit date',
-    );
-    if (picked != null) setState(() => _date = picked);
-  }
-
   Future<void> _save() async {
     setState(() => _saveError = null);
     if (!(_formKey.currentState?.validate() ?? false)) return;
-    if (_date == null) {
-      setState(() => _saveError = 'Choose the submit date');
-      return;
-    }
     final deliverable = _deliverable == _other ? _otherCtrl.text.trim() : (_deliverable ?? '');
     setState(() => _saving = true);
     try {
+      // The newer server ignores this date and uses the client's current card.
+      // An older server needs one, so today is sent; the app still joins the
+      // task to the client's current card.
+      final card = _selectedClient;
+      final sendDate = (card != null && card.cardDate.isNotEmpty)
+          ? card.cardDate
+          : DateFormat('yyyy-MM-dd').format(DateTime.now());
       final res = await http
           .post(
             Uri.parse('${ApiConfig.baseUrl}/workspace-tasks/additional-task'),
@@ -172,7 +165,7 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
               'employee': widget.employeeName,
               'client': _client,
               'deliverable': deliverable,
-              'date': DateFormat('yyyy-MM-dd').format(_date!),
+              'date': sendDate,
               'count': _count,
               'description': _notesCtrl.text.trim(),
             }),
@@ -275,7 +268,7 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  _role.isEmpty ? 'Shows in your Employee Workspace' : 'Added by ${widget.employeeName} ($_role)',
+                  _role.isEmpty ? 'Shows in the client’s current card' : 'Added by ${widget.employeeName} ($_role)',
                   style: TextStyle(color: Colors.white.withValues(alpha: .85), fontSize: 11.5),
                 ),
               ],
@@ -285,6 +278,51 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
             tooltip: 'Close',
             onPressed: _saving ? null : () => Navigator.of(context).pop(),
             icon: const Icon(Icons.close_rounded, color: Colors.white),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _prettyDate(String raw) {
+    final d = DateTime.tryParse(raw);
+    return d == null ? raw : DateFormat('dd MMM yyyy').format(d);
+  }
+
+  Widget _cardInfo(_ClientOption? client) {
+    if (client == null) return const SizedBox.shrink();
+    final has = client.cardDate.isNotEmpty || !client.hasCardInfo;
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: has ? const Color(0xFFEFF6FF) : const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: has ? const Color(0xFFBFDBFE) : const Color(0xFFFCD34D)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            has ? Icons.link_rounded : Icons.info_outline_rounded,
+            size: 17,
+            color: has ? _blue : const Color(0xFFD97706),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              !client.hasCardInfo
+                  ? 'Joins this client’s current card and shows in its Additional Tasks tab.'
+                  : has
+                  ? 'Joins this client’s current card (deadline ${_prettyDate(client.cardDate)} '
+                      'from Tasks Assign) and shows in its Additional Tasks tab.'
+                  : 'This client has no assigned card yet. Assign it in Tasks Assign first.',
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+                color: has ? const Color(0xFF1E3A8A) : const Color(0xFF92400E),
+              ),
+            ),
           ),
         ],
       ),
@@ -352,6 +390,7 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
                     }),
             validator: (v) => v == null || v.isEmpty ? 'Choose a client' : null,
           ),
+          _cardInfo(client),
           const SizedBox(height: 14),
 
           // 2. Deliverable (client's own first, then common ones, then Other)
@@ -397,50 +436,23 @@ class _AdditionalTaskDialogState extends State<AdditionalTaskDialog> {
           ],
           const SizedBox(height: 14),
 
-          // 3. Date + number of rows
-          LayoutBuilder(builder: (context, c) {
-            final date = InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: _saving ? null : _pickDate,
-              child: InputDecorator(
-                decoration: _deco('Submit date *', Icons.calendar_month_rounded),
-                child: Text(
-                  _date == null ? 'Choose date' : DateFormat('dd MMM yyyy, EEE').format(_date!),
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                    color: _date == null ? _muted : _ink,
-                  ),
+          // 3. Number of rows (no submit date — the card's deadline is used)
+          InputDecorator(
+            decoration: _deco('Rows', Icons.format_list_numbered_rounded),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _stepButton(Icons.remove_rounded, _count > 1 ? () => setState(() => _count--) : null),
+                SizedBox(
+                  width: 44,
+                  child: Text('$_count',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900, color: _ink)),
                 ),
-              ),
-            );
-            final rows = InputDecorator(
-              decoration: _deco('Rows', Icons.format_list_numbered_rounded),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _stepButton(Icons.remove_rounded, _count > 1 ? () => setState(() => _count--) : null),
-                  SizedBox(
-                    width: 34,
-                    child: Text('$_count',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900, color: _ink)),
-                  ),
-                  _stepButton(Icons.add_rounded, _count < 50 ? () => setState(() => _count++) : null),
-                ],
-              ),
-            );
-            if (c.maxWidth < 400) {
-              return Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [date, const SizedBox(height: 14), rows],
-              );
-            }
-            return Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [Expanded(child: date), const SizedBox(width: 12), SizedBox(width: 170, child: rows)],
-            );
-          }),
+                _stepButton(Icons.add_rounded, _count < 50 ? () => setState(() => _count++) : null),
+              ],
+            ),
+          ),
           const SizedBox(height: 14),
 
           // 4. Notes
@@ -529,5 +541,15 @@ class _ClientOption {
   final String name;
   final List<String> deliverables;
   final List<String> assigned;
-  const _ClientOption(this.name, this.deliverables, this.assigned);
+  // The client's current card date (deadline from Tasks Assign), '' if none.
+  final String cardDate;
+  // false when the server is an older version that does not send card_date.
+  final bool hasCardInfo;
+  const _ClientOption(
+    this.name,
+    this.deliverables,
+    this.assigned,
+    this.cardDate,
+    this.hasCardInfo,
+  );
 }

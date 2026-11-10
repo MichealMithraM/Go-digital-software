@@ -134,6 +134,10 @@ class ContentCalendarScreen extends StatefulWidget {
   /// Main admin view: everything is visible, nothing can be changed.
   final bool readOnly;
 
+  /// Opened from a client card where the Tasks Assign screen names this
+  /// employee as Page / Ads Handler (role of the employee does not matter).
+  final bool viaAssignment;
+
   const ContentCalendarScreen({
     Key? key,
     required this.apiBaseUrl,
@@ -144,6 +148,7 @@ class ContentCalendarScreen extends StatefulWidget {
     this.initialClient,
     this.myTasksMode = false,
     this.readOnly = false,
+    this.viaAssignment = false,
   }) : super(key: key);
 
   @override
@@ -186,6 +191,22 @@ class _ContentCalendarScreenState extends State<ContentCalendarScreen> {
     ).trim();
     if (assignedName.isEmpty) return true;
     return assignedName.toLowerCase() == widget.currentUserName.trim().toLowerCase();
+  }
+
+  /// The employee a row belongs to / was given to (first name found), used so
+  /// the admin view shows who owns every row.
+  String _employeeOf(Map<String, dynamic> r) {
+    for (final k in const [
+      'task_employee_name',
+      'cc_assigned_to_name',
+      'assigned_to_name',
+      'employee_name',
+      'allocated_employee',
+    ]) {
+      final v = _str(r[k]).trim();
+      if (v.isNotEmpty) return v;
+    }
+    return 'Not assigned';
   }
 
   bool _loading = true;
@@ -324,12 +345,30 @@ class _ContentCalendarScreenState extends State<ContentCalendarScreen> {
     if (!silent && !_loading) setState(() => _loading = true);
     _loadPlannerCalIds();
     try {
-      final res = await http.get(
-        Uri.parse(
-          '$_baseUrl/tasks/client-tasks/${Uri.encodeComponent(clientName)}',
-        ),
+      // The main admin reads every row through its own route; handlers keep
+      // using /tasks/client-tasks.
+      // Employees use the normal route first; the admin (and an employee whose
+      // role is not Page / Ads Handler but is the handler of this client) use
+      // the wide route first. Whichever answers 200 wins, so no access error
+      // is shown while the other route can serve the rows.
+      final enc = Uri.encodeComponent(clientName);
+      final emp = Uri.encodeComponent(widget.currentUserName);
+      Future<http.Response> loadFrom(String path) => http.get(
+        Uri.parse('$_baseUrl/$path/$enc?employee=$emp'),
         headers: _headers,
       );
+      const ownRoute = 'tasks/client-tasks';
+      const wideRoute = 'workspace-tasks/admin/content-calendar';
+      final routes = widget.readOnly
+          ? [wideRoute, ownRoute]
+          : widget.viaAssignment
+          ? [ownRoute, wideRoute]
+          : [ownRoute];
+      var res = await loadFrom(routes.first);
+      for (final path in routes.skip(1)) {
+        if (res.statusCode == 200) break;
+        res = await loadFrom(path);
+      }
       if (!mounted) return;
       if (_selectedClient == null ||
           _selectedClient!['client_name'].toString() != clientName)
@@ -365,19 +404,22 @@ class _ContentCalendarScreenState extends State<ContentCalendarScreen> {
         // so their role assignments must not be duplicated here. For other
         // roles, show only deliverables that have actually been assigned to
         // this employee (not every old/unassigned client calendar row).
-        if (!_isPageOrAdsHandler) {
-          list = list.where(_assignedToCurrentEmployee).toList();
-        } else {
-          list = list.where((row) {
-            final sourceRole = _str(row['source_role'])
-                .trim()
-                .toLowerCase()
-                .replaceAll(RegExp(r'[\s-]+'), '_');
-            return !sourceRole.contains('page_handler') &&
-                !sourceRole.contains('pagehandler') &&
-                !sourceRole.contains('ads_handler') &&
-                !sourceRole.contains('adshandler');
-          }).toList();
+        // The main admin (readOnly) sees every row of the card, whoever owns it.
+        if (!widget.readOnly) {
+          if (!_isPageOrAdsHandler) {
+            list = list.where(_assignedToCurrentEmployee).toList();
+          } else {
+            list = list.where((row) {
+              final sourceRole = _str(row['source_role'])
+                  .trim()
+                  .toLowerCase()
+                  .replaceAll(RegExp(r'[\s-]+'), '_');
+              return !sourceRole.contains('page_handler') &&
+                  !sourceRole.contains('pagehandler') &&
+                  !sourceRole.contains('ads_handler') &&
+                  !sourceRole.contains('adshandler');
+            }).toList();
+          }
         }
 
         for (final r in list) {
@@ -516,7 +558,6 @@ class _ContentCalendarScreenState extends State<ContentCalendarScreen> {
   }
 
   void _onFieldChanged(Map<String, dynamic> row, String field, dynamic value) {
-    if (_blockedReadOnly()) return;
     final id = _asInt(row['id']);
     row[field] = value;
     (_pendingEdits[id] ??= {})[field] = value;
@@ -2321,11 +2362,7 @@ class _ContentCalendarScreenState extends State<ContentCalendarScreen> {
             DataColumn(label: Padding(padding: EdgeInsets.symmetric(horizontal: 12), child: Text('ACTION', style: headingStyle))),
           ],
           rows: visibleRows.map((row) {
-            final assignedName = _str(row['cc_assigned_to_name']).isNotEmpty
-                ? _str(row['cc_assigned_to_name'])
-                : (_str(row['assigned_to_name']).isNotEmpty
-                    ? _str(row['assigned_to_name'])
-                    : (_str(row['employee_name']).isNotEmpty ? _str(row['employee_name']) : 'Not assigned'));
+            final assignedName = _employeeOf(row);
             final deliverable = _str(row['deliverable']).isNotEmpty
                 ? _str(row['deliverable'])
                 : (_str(row['deliverable_name']).isNotEmpty
@@ -2566,13 +2603,7 @@ class _ContentCalendarScreenState extends State<ContentCalendarScreen> {
 
     return Column(
       children: rows.map((row) {
-        final assignedName = _str(row['cc_assigned_to_name']).isNotEmpty
-            ? _str(row['cc_assigned_to_name'])
-            : (_str(row['assigned_to_name']).isNotEmpty
-                ? _str(row['assigned_to_name'])
-                : (_str(row['employee_name']).isNotEmpty
-                    ? _str(row['employee_name'])
-                    : 'Not assigned'));
+        final assignedName = _employeeOf(row);
         final deliverable = _str(row['deliverable']).isNotEmpty
             ? _str(row['deliverable'])
             : (_str(row['deliverable_name']).isNotEmpty
@@ -3934,7 +3965,9 @@ DataColumn _sheetColumn(
       child: TextFormField(
         key: ValueKey('cc-${row['id']}-$field-$_sheetRev'),
         initialValue: _str(row[field]),
-        readOnly: widget.readOnly || _isAssigned(row),
+        readOnly: _isAssigned(row),
+        enableInteractiveSelection: true,
+        keyboardType: TextInputType.multiline,
         minLines: 1,
         maxLines: 4,
         style: const TextStyle(
@@ -4799,5 +4832,3 @@ class _GuideStep extends StatelessWidget {
         ]),
       );
 }
-
-

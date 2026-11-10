@@ -439,6 +439,14 @@ function markAdditional(card, by) {
 
 const emit = (req, payload) => req.app.get('io')?.emit('task_updated', payload);
 
+// Monthly "maintain day" (e.g. '12') from a task_assignments.maintenance_date
+// that may be "12", "12/11/2026" or a real date.
+function maintenanceDay(value) {
+  const raw = String(value ?? '').trim();
+  if (/^\d{1,2}$/.test(raw)) return raw;
+  return dateKey(value).slice(8, 10);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Everyone assigned on this client (+ deadline): role, person, and each task
 // category with completed (approved) / total.
@@ -548,6 +556,9 @@ router.get('/cards', async (req, res) => {
       }
       const card = cardFor(assignment.client_name, deadlineOf(assignment));
       cardByAssignment.set(String(assignment.id), card);
+      // Package + monthly maintain day (from Tasks Assign) for the client card.
+      card.package = card.package || String(assignment.deliverables || '').trim();
+      card.maintenance_day = card.maintenance_day || maintenanceDay(assignment.maintenance_date);
       // Latest assignment time → the "NEW" ribbon on the card.
       const created = assignment.created_at ? new Date(assignment.created_at) : null;
       if (created && !Number.isNaN(created.getTime()) &&
@@ -2314,6 +2325,8 @@ router.get('/compliance', async (req, res) => {
 
 // GET /admin/cards  → every client card (client + deadline), last 3 months,
 // with the whole team's counts, team list and late count.
+// Additional tasks are included too (as tasks flagged is_additional) so the
+// admin workspace can show them inside the client's current card.
 router.get('/admin/cards', async (req, res) => {
   try {
     const rules = await loadRules(db);
@@ -2336,6 +2349,9 @@ router.get('/admin/cards', async (req, res) => {
     };
     for (const w of collected.work) {
       const card = cardFor(w.assignment.client_name, w.due);
+      // Package + monthly maintain day (from Tasks Assign) for the client card.
+      card.package = card.package || String(w.assignment.deliverables || '').trim();
+      card.maintenance_day = card.maintenance_day || maintenanceDay(w.assignment.maintenance_date);
       const created = w.assignment.created_at ? new Date(w.assignment.created_at) : null;
       if (created && !Number.isNaN(created.getTime()) &&
           (!card.assigned_at || created > new Date(card.assigned_at))) {
@@ -2384,6 +2400,38 @@ router.get('/admin/cards', async (req, res) => {
         pending: !c.done && !['IN PROGRESS', 'ON HOLD'].includes(c.status) ? 1 : 0,
       });
     }
+
+    // Additional tasks (Page / Ads Handler "Add Additional Task", admin or
+    // handler-assigned). The app attaches each one to the client's CURRENT card.
+    try {
+      const active = await activeClientSet();
+      const [addLists] = await db.query(
+        `SELECT id, client_name, employee_name, deliverables, submission_date, no_of_rows
+         FROM task_list WHERE additional_task_id IS NOT NULL`,
+      );
+      for (const list of addLists) {
+        if (!active.has(norm(list.client_name))) continue;
+        const rows = await loadRows(list.id, false);
+        const by = await assignedByFor(list.id, list.client_name);
+        const card = cardFor(list.client_name, dateKey(list.submission_date));
+        card.tasks.push({
+          key: `additional:${list.id}`,
+          name: list.deliverables,
+          role: 'Additional task',
+          role_key: 'additional',
+          employee: String(list.employee_name || '').trim(),
+          is_additional: true,
+          handler_assigned: !!by,
+          assigned_by: by?.name || 'Admin',
+          assigned_by_role: by?.role || '',
+          awaiting_handoff: false,
+          ...countStates(rows, Number(list.no_of_rows) || 1),
+        });
+      }
+    } catch (err) {
+      console.error('admin/cards additional tasks failed:', err.message);
+    }
+
     for (const item of compliance) {
       if (item.status !== 'LATE') continue;
       const card = cards.get(`${norm(item.client)}|${item.submission_date}`);
@@ -3257,17 +3305,25 @@ router.get('/performance/detail', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // Page / Ads Handler — "Add Additional Task" from Employee Workspace
 //
-//   GET  /additional-task/options?employee=   → { allowed, clients: [{ name, deliverables }] }
-//   POST /additional-task  { employee, client, deliverable, date, count, description }
+//   GET  /additional-task/options?employee=   → { allowed, clients: [{ name, deliverables, card_date }] }
+//   POST /additional-task  { employee, client, deliverable, count, description }
 //
-// Creates (or adds rows to) the handler's own additional task list for that
-// client / deliverable / date. It shows as a client card with the
-// ADDITIONAL TASK ribbon ("Added by <name> (Page Handler)") in My Tasks.
+// No date is typed. The task joins the client's CURRENT card — the deadline
+// from Tasks Assign (nearest today or later, otherwise the latest one) — and
+// shows in that card's "Additional Tasks" tab. It never creates its own card.
 // ═════════════════════════════════════════════════════════════════════════════
 const COMMON_DELIVERABLES = [
   'Poster', 'Reel', 'Carousel', 'Story', 'Video', 'Meta Ads', 'Google Ads',
   'Instagram Post', 'Facebook Post', 'YouTube Video', 'Landing Page', 'Blog', 'Report',
 ];
+
+// The card an additional task joins = the client's CURRENT card:
+// nearest deadline today or later, otherwise the latest one (from Tasks Assign).
+function pickCardDate(dates) {
+  const today = appDay();
+  const list = [...new Set(dates.filter(Boolean))].sort();
+  return list.find((d) => d >= today) || list[list.length - 1] || '';
+}
 
 /** Page / Ads Handler = role says so, or named as page / ads handler on any assignment. */
 async function handlerRoleOf(employee) {
@@ -3300,9 +3356,12 @@ router.get('/additional-task/options', async (req, res) => {
     );
     const [assignments] = await db.query('SELECT * FROM task_assignments WHERE is_assigned = 1');
     const byClient = new Map();
+    const cardDates = new Map();
     for (const a of assignments) {
       const k = norm(a.client_name);
       if (!byClient.has(k)) byClient.set(k, new Set());
+      if (!cardDates.has(k)) cardDates.set(k, []);
+      cardDates.get(k).push(deadlineOf(a));
       for (const r of ROLES) for (const t of parseTasks(a[r.tasks])) if (t.name) byClient.get(k).add(t.name);
     }
     const active = await activeClientSet();
@@ -3315,7 +3374,12 @@ router.get('/additional-task/options', async (req, res) => {
       const own = [...(byClient.get(norm(name)) || [])];
       const all = [...own];
       for (const d of COMMON_DELIVERABLES) if (!all.some((x) => norm(x) === norm(d))) all.push(d);
-      list.push({ name, deliverables: all, assigned: own });
+      list.push({
+        name,
+        deliverables: all,
+        assigned: own,
+        card_date: pickCardDate(cardDates.get(norm(name)) || []),
+      });
     }
     return res.json({ success: true, allowed: Boolean(role), role, clients: list });
   } catch (err) {
@@ -3328,7 +3392,6 @@ router.post('/additional-task', async (req, res) => {
   const employee = employeeFrom(req);
   const client = String(req.body?.client || '').trim();
   const deliverable = String(req.body?.deliverable || '').trim().replace(/\s+/g, ' ');
-  const date = dateKey(req.body?.date);
   const count = Math.min(Math.max(parseInt(req.body?.count, 10) || 1, 1), 50);
   const description = String(req.body?.description || '').trim();
 
@@ -3336,8 +3399,6 @@ router.post('/additional-task', async (req, res) => {
   if (!client) return res.status(400).json({ success: false, message: 'Choose a client' });
   if (!deliverable) return res.status(400).json({ success: false, message: 'Enter the deliverable' });
   if (deliverable.length > 120) return res.status(400).json({ success: false, message: 'Deliverable name is too long' });
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ success: false, message: 'Choose a valid date' });
-  if (date < appDay()) return res.status(400).json({ success: false, message: 'The date cannot be in the past' });
 
   const connection = await db.getConnection();
   try {
@@ -3355,8 +3416,22 @@ router.post('/additional-task', async (req, res) => {
     }
     const clientName = activeClient.company_name;
 
+    // The card date comes from Tasks Assign (the client's current card).
+    const [asg] = await connection.query(
+      `SELECT deadline, maintenance_date FROM task_assignments
+       WHERE is_assigned = 1 AND LOWER(TRIM(client_name)) = LOWER(TRIM(?))`,
+      [clientName],
+    );
+    const date = pickCardDate(asg.map(deadlineOf));
+    if (!date) {
+      return res.status(400).json({
+        success: false,
+        message: `${clientName} has no assigned card yet. Assign it in Tasks Assign first.`,
+      });
+    }
+
     await connection.beginTransaction();
-    // Same client + deliverable + date → add rows to that list.
+    // Same client + deliverable + card date → add rows to that list.
     const [[existing]] = await connection.query(
       `SELECT id, no_of_rows FROM task_list
        WHERE additional_task_id IS NOT NULL AND task_assignment_id IS NULL
@@ -3407,7 +3482,7 @@ router.post('/additional-task', async (req, res) => {
         due_date: date,
         rows: count,
         role,
-        section: 'My Tasks',
+        section: 'Additional Tasks',
       },
     });
   } catch (err) {
@@ -3497,7 +3572,7 @@ router.put('/additional-task/:listId', async (req, res) => {
     return res.json({
       success: true,
       message: 'Additional task updated',
-      data: { task_list_id: listId, client: list.client_name, deliverable: newName, due_date: newDate, section: 'My Tasks' },
+      data: { task_list_id: listId, client: list.client_name, deliverable: newName, due_date: newDate, section: 'Additional Tasks' },
     });
   } catch (err) {
     try { await connection.rollback(); } catch (_) { /* ignore */ }
@@ -3552,5 +3627,72 @@ router.post('/additional-task/:listId/rows', async (req, res) => {
   }
 });
 
-module.exports = router;
+// ═════════════════════════════════════════════════════════════════════════════
+// Content Calendar rows for the MAIN ADMIN and for the Page / Ads Handler named
+// on that client in Tasks Assign (the employee's job role does not matter).
+//   GET /admin/content-calendar/:client?employee=
+// ═════════════════════════════════════════════════════════════════════════════
+router.get('/admin/content-calendar/:client', async (req, res) => {
+  try {
+    const client = String(req.params.client || '').trim();
+    const emp = String(req.query.employee || '').trim();
+    const userType = String(req.user?.userType || req.user?.user_type || '').toLowerCase();
+    const isAdmin = userType === 'admin' || (emp && await isAdminUser(emp));
+    const isHandler = emp && (await reviewerAssignmentIds(emp, client)).length > 0;
+    if (!isAdmin && !isHandler) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only the Page / Ads Handler of this client can open its Content Calendar',
+      });
+    }
+    const holdCols = Array.from({ length: 10 }, (_, i) =>
+      `tti.hold_time_${i + 1}, tti.restart_time_${i + 1}`).join(', ');
+    const [rows] = await db.query(
+      `SELECT cc.*,
+              (COALESCE(tti.content_calendar_assigned, 0) = 1 OR cc.cc_handoff_at IS NOT NULL
+               OR COALESCE(cc.is_emergency, 0) = 1) AS content_calendar_assigned,
+              cc.assigned_to_name AS cc_assigned_to_name,
+              tti.status AS task_status, tti.review_status AS review_status,
+              tti.duration_secs AS task_duration_secs, tti.start_time AS task_start_time,
+              tti.complete_time AS task_complete_time, tti.performance AS task_performance,
+              tti.comment AS task_comment, tti.employee_notes AS task_employee_notes,
+              tl.employee_name AS task_employee_name,
+              mr.manager_action AS task_review_action, mr.manager_comment AS task_review_comment,
+              COALESCE(ta.deadline, ta.maintenance_date) AS source_deadline, ${holdCols}
+       FROM content_calendar cc
+       LEFT JOIN time_tracking_task_items tti ON tti.id = cc.task_item_id
+       LEFT JOIN task_list tl ON tl.id = tti.task_list_id
+       LEFT JOIN manager_review mr ON mr.tracking_item_id = tti.id
+       LEFT JOIN task_assignments ta ON ta.id = cc.source_assignment_id
+       WHERE LOWER(TRIM(cc.client_name)) = LOWER(TRIM(?))
+         AND (cc.source_assignment_id IS NULL OR cc.source_active = 1)
+       ORDER BY cc.deliverable, cc.source_assignment_id, cc.source_task_index,
+                cc.source_row_number, cc.id`,
+      [client],
+    );
+    const ids = [...new Set(rows.map((r) => r.source_assignment_id).filter(Boolean))];
+    const asg = new Map();
+    if (ids.length) {
+      const [a] = await db.query('SELECT * FROM task_assignments WHERE id IN (?)', [ids]);
+      a.forEach((x) => asg.set(Number(x.id), x));
+    }
+    for (const r of rows) {
+      if (r.s_no == null) r.s_no = r.source_row_number;
+      r.submit_date = dateKey(r.submit_date);
+      if (r.publish_date) r.publish_date = dateKey(r.publish_date);
+      r.source_deadline = dateKey(r.source_deadline);
+      const a = asg.get(Number(r.source_assignment_id));
+      const role = ROLES.find((x) => x.key === r.source_role);
+      if (a && role) {
+        r.allocated_employee = splitPeople(a[role.emp])[0] || '';
+        r.allocated_role = role.label;
+      }
+    }
+    return res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('GET /workspace-tasks/admin/content-calendar ERROR:', err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
+module.exports = router;

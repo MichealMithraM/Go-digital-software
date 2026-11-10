@@ -13,6 +13,21 @@ const _navy = Color(0xFF081C67);
 const _page = Color(0xFFF7F9FD);
 const _line = Color(0xFFD8E1F0);
 
+String _attendanceMethodLabel(dynamic value) {
+  switch ('${value ?? ''}'.trim().toLowerCase()) {
+    case 'ios_mobile':
+      return 'iOS Mobile';
+    case 'manual':
+      return 'Manual';
+    case 'android_mobile':
+    case 'mobile': // Historical Android APK records.
+    case 'wifi': // Historical mobile records saved through office Wi-Fi.
+      return 'Android Mobile';
+    default:
+      return 'Manual';
+  }
+}
+
 class ClockLogsPage extends StatefulWidget {
   const ClockLogsPage({super.key});
   static Widget builder(BuildContext context) => const ClockLogsPage();
@@ -982,6 +997,91 @@ class _ClockValues extends StatelessWidget {
   }
 }
 
+class _IosWebAccessDialog extends StatefulWidget {
+  const _IosWebAccessDialog();
+
+  @override
+  State<_IosWebAccessDialog> createState() => _IosWebAccessDialogState();
+}
+
+class _IosWebAccessDialogState extends State<_IosWebAccessDialog> {
+  late Future<List<Map<String, dynamic>>> _devices;
+
+  @override
+  void initState() {
+    super.initState();
+    _devices = HrmsClockLogsApi.iosWebDevices();
+  }
+
+  Future<void> _update(int id, String status) async {
+    try {
+      await HrmsClockLogsApi.updateIosWebDevice(id, status);
+      if (mounted) {
+        setState(() => _devices = HrmsClockLogsApi.iosWebDevices());
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.toString().replaceFirst('Exception: ', ''))),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('iPhone web attendance access'),
+    content: SizedBox(
+      width: 620,
+      child: FutureBuilder<List<Map<String, dynamic>>>(
+        future: _devices,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const SizedBox(height: 150, child: Center(child: CircularProgressIndicator()));
+          }
+          if (snapshot.hasError) return Text('${snapshot.error}');
+          final devices = snapshot.data ?? const [];
+          if (devices.isEmpty) return const Text('No iPhone web access requests yet.');
+          return ListView.separated(
+            shrinkWrap: true,
+            itemCount: devices.length,
+            separatorBuilder: (_, _) => const Divider(),
+            itemBuilder: (context, index) {
+              final device = devices[index];
+              final id = (device['id'] as num?)?.toInt();
+              final status = '${device['status'] ?? 'pending'}';
+              return ListTile(
+                leading: const Icon(Icons.phone_iphone_rounded, color: _blue),
+                title: Text('${device['full_name'] ?? 'Employee'}'),
+                subtitle: Text('Status: $status\nRequested: ${device['created_at'] ?? '--'}'),
+                isThreeLine: true,
+                trailing: id == null ? null : Wrap(
+                  spacing: 4,
+                  children: [
+                    if (status != 'approved')
+                      IconButton(
+                        tooltip: 'Approve',
+                        onPressed: () => _update(id, 'approved'),
+                        icon: const Icon(Icons.check_circle_outline, color: Color(0xFF149B2B)),
+                      ),
+                    if (status != 'revoked')
+                      IconButton(
+                        tooltip: 'Revoke',
+                        onPressed: () => _update(id, 'revoked'),
+                        icon: const Icon(Icons.block_outlined, color: Color(0xFFF0182A)),
+                      ),
+                  ],
+                ),
+              );
+            },
+          );
+        },
+      ),
+    ),
+    actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
+  );
+}
+
 class _ClockLogsPageState extends State<ClockLogsPage> {
   final _employeeSearchController = TextEditingController();
   final _tableHeaderScrollCtrl = ScrollController();
@@ -1322,6 +1422,13 @@ class _ClockLogsPageState extends State<ClockLogsPage> {
     if (selected != null && mounted) _openEmployeeCalendar(selected);
   }
 
+  Future<void> _manageIosWebAccess() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => const _IosWebAccessDialog(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (MediaQuery.sizeOf(context).width < 600) {
@@ -1467,6 +1574,12 @@ class _ClockLogsPageState extends State<ClockLogsPage> {
                 borderRadius: BorderRadius.circular(7),
               ),
             ),
+          ),
+          const SizedBox(width: 10),
+          OutlinedButton.icon(
+            onPressed: _manageIosWebAccess,
+            icon: const Icon(Icons.phone_iphone_rounded, size: 20),
+            label: const Text('iPhone web access'),
           ),
         ],
       ),
@@ -1939,7 +2052,7 @@ class _ClockLogsPageState extends State<ClockLogsPage> {
               Expanded(
                 child: _detailValue(
                   'Method',
-                  item['method']?.toString() ?? '-',
+                  _attendanceMethodLabel(item['method']),
                   emphasized: true,
                 ),
               ),

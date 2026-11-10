@@ -8,6 +8,7 @@ import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
 import '../../services/api_config.dart';
+import '../../services/attendance_client_identity.dart';
 import '../../services/attendance_location.dart';
 import '../../services/auth_service.dart';
 import '../../services/hrms_attendance_tracker.dart';
@@ -101,6 +102,7 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
       'Authorization': 'Bearer $token',
       'Accept': 'application/json',
       'Content-Type': 'application/json',
+      ...await AttendanceClientIdentity.headers(),
     };
     final response =
         await (post
@@ -174,13 +176,41 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
 
   Future<void> _punch() async {
     if (kIsWeb) {
+      if (await AttendanceClientIdentity.isIosWeb) {
+        final token = _token;
+        if (token == null) return;
+        try {
+          final registration = await _call(
+            'ios-web-devices/register',
+            token,
+            post: true,
+          );
+          if (registration['status'] != 'approved') {
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('This iPhone is registered. Waiting for admin approval.'),
+                duration: Duration(seconds: 5),
+              ),
+            );
+            return;
+          }
+        } catch (error) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(_message(error))),
+          );
+          return;
+        }
+      } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Check In / Check Out is only available on the mobile app.'),
+          content: Text('Check In / Check Out is available only in the Android app or an approved iPhone browser.'),
           duration: Duration(seconds: 4),
         ),
       );
       return;
+      }
     }
     final token = _token;
     if (token == null || _loading || _punching || _error != null) return;
@@ -220,14 +250,17 @@ class _ClockViewState extends State<_ClockView> with WidgetsBindingObserver {
             'latitude': pos.latitude,
             'longitude': pos.longitude,
             'accuracy': pos.accuracy,
+            'capturedAt': pos.timestamp.toUtc().toIso8601String(),
           };
         } catch (_) {
+          if (kIsWeb) rethrow;
           payload = <String, dynamic>{};
         }
       } else {
         payload = await AttendanceLocation.checkInPayload(
           client: _client,
           token: token,
+          forceLocation: kIsWeb,
         );
       }
       if (!mounted || token != _token) return;

@@ -1119,6 +1119,11 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
   GoogleMapController? controller;
   int _request = 0;
   int? _selectedWaitingReasonId;
+  Timer? _playbackTimer;
+  bool _isPlayingRoute = false;
+  bool _routePlaybackFinished = false;
+  int _playbackPointIndex = 0;
+  int? _playbackWaitingReasonId;
 
   @override
   void initState() {
@@ -1138,6 +1143,7 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
   @override
   void dispose() {
     _request++;
+    _playbackTimer?.cancel();
     controller?.dispose();
     super.dispose();
   }
@@ -1148,6 +1154,12 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
       loading = true;
       error = null;
       _selectedWaitingReasonId = null;
+      _playbackTimer?.cancel();
+      _playbackTimer = null;
+      _isPlayingRoute = false;
+      _routePlaybackFinished = false;
+      _playbackPointIndex = 0;
+      _playbackWaitingReasonId = null;
     });
     final id = widget.employee.employeeUserId;
     if (id == null) {
@@ -1180,7 +1192,12 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
     final longitude = (reason['longitude'] as num?)?.toDouble();
     if (!mounted) return;
     setState(
-      () => _selectedWaitingReasonId = (reason['id'] as num?)?.toInt(),
+      () {
+        _playbackTimer?.cancel();
+        _playbackTimer = null;
+        _isPlayingRoute = false;
+        _selectedWaitingReasonId = (reason['id'] as num?)?.toInt();
+      },
     );
     if (latitude != null && longitude != null) {
       await controller?.animateCamera(
@@ -1197,6 +1214,109 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
     );
   }
 
+  DateTime? _timestamp(dynamic value) => DateTime.tryParse('$value')?.toLocal();
+
+  void _toggleRoutePlayback(List<Map> routePoints, List<Map> waitingReasons) {
+    if (routePoints.length < 2) return;
+
+    if (_isPlayingRoute) {
+      setState(() {
+        _playbackTimer?.cancel();
+        _playbackTimer = null;
+        _isPlayingRoute = false;
+      });
+      return;
+    }
+
+    if (_routePlaybackFinished) {
+      setState(() {
+        _routePlaybackFinished = false;
+        _playbackPointIndex = 0;
+        _playbackWaitingReasonId = null;
+      });
+    }
+
+    final intervalMilliseconds = (12000 / (routePoints.length - 1))
+        .round()
+        .clamp(90, 500)
+        .toInt();
+    setState(() => _isPlayingRoute = true);
+    _movePlaybackCamera(routePoints[_playbackPointIndex]);
+    _playbackTimer = Timer.periodic(
+      Duration(milliseconds: intervalMilliseconds),
+      (_) => _advanceRoutePlayback(routePoints, waitingReasons),
+    );
+  }
+
+  void _advanceRoutePlayback(List<Map> routePoints, List<Map> waitingReasons) {
+    if (!mounted || !_isPlayingRoute) return;
+    final nextIndex = _playbackPointIndex + 1;
+    if (nextIndex >= routePoints.length) {
+      setState(() {
+        _playbackTimer?.cancel();
+        _playbackTimer = null;
+        _isPlayingRoute = false;
+        _routePlaybackFinished = true;
+        _playbackPointIndex = routePoints.length - 1;
+      });
+      return;
+    }
+
+    final previousTime = _timestamp(routePoints[_playbackPointIndex]['recordedAt']);
+    final currentTime = _timestamp(routePoints[nextIndex]['recordedAt']);
+    Map? reachedReason;
+    for (final reason in waitingReasons) {
+      final submittedAt = _timestamp(reason['submittedAt']);
+      final wasReached = submittedAt != null &&
+          currentTime != null &&
+          !submittedAt.isAfter(currentTime) &&
+          (previousTime == null || submittedAt.isAfter(previousTime));
+      if (wasReached) reachedReason = reason;
+    }
+
+    setState(() {
+      _playbackPointIndex = nextIndex;
+      if (reachedReason != null) {
+        _playbackWaitingReasonId = (reachedReason['id'] as num?)?.toInt();
+      }
+    });
+    _movePlaybackCamera(routePoints[nextIndex]);
+  }
+
+  void _movePlaybackCamera(Map point) {
+    final latitude = (point['latitude'] as num?)?.toDouble();
+    final longitude = (point['longitude'] as num?)?.toDouble();
+    if (latitude == null || longitude == null) return;
+    unawaited(
+      controller?.animateCamera(
+            CameraUpdate.newLatLng(LatLng(latitude, longitude)),
+          ) ??
+          Future<void>.value(),
+    );
+  }
+
+  double _playbackProgressFor(List<Map> routePoints) {
+    if (routePoints.length < 2) return 0;
+    if (_routePlaybackFinished) return 1;
+    final start = _timestamp(routePoints.first['recordedAt']);
+    final current = _timestamp(
+      routePoints[_playbackPointIndex.clamp(0, routePoints.length - 1).toInt()]
+          ['recordedAt'],
+    );
+    final end = _timestamp(routePoints.last['recordedAt']);
+    final duration = start == null || end == null
+        ? 0
+        : end.difference(start).inMilliseconds;
+    if (current != null && duration > 0) {
+      return (current.difference(start!).inMilliseconds / duration)
+          .clamp(0, 1)
+          .toDouble();
+    }
+    return (_playbackPointIndex / (routePoints.length - 1))
+        .clamp(0, 1)
+        .toDouble();
+  }
+
   @override
   Widget build(BuildContext context) {
     final points = (data?['routePoints'] as List? ?? [])
@@ -1211,9 +1331,26 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
     final activities = (data?['activities'] as List? ?? [])
         .whereType<Map>()
         .toList();
+    final playbackPoints = activities
+        .where(
+          (item) =>
+              item['latitude'] is num &&
+              item['longitude'] is num &&
+              (item['latitude'] as num) != 0 &&
+              (item['longitude'] as num) != 0,
+        )
+        .toList();
     final waitingReasons = (data?['waitingReasons'] as List? ?? [])
         .whereType<Map>()
         .toList();
+    final playbackVisible = _isPlayingRoute || _routePlaybackFinished;
+    final highlightedWaitingReasonId =
+        _playbackWaitingReasonId ?? _selectedWaitingReasonId;
+    final playbackIndex = playbackPoints.isEmpty
+        ? 0
+        : _playbackPointIndex
+              .clamp(0, playbackPoints.length - 1)
+              .toInt();
     final durationSeconds = (data?['durationSeconds'] as num?)?.toInt() ?? 0;
     final duration = Duration(seconds: durationSeconds);
     final stops = _countStops(activities);
@@ -1379,13 +1516,32 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
                                             BitmapDescriptor.hueGreen,
                                           ),
                                     ),
-                                    if (points.length > 1)
+                                    if (points.length > 1 && !playbackVisible)
                                       Marker(
                                         markerId: const MarkerId('current'),
                                         position: points.last,
                                         infoWindow: InfoWindow(
                                           title: widget.employee.name,
                                         ),
+                                      ),
+                                    if (playbackVisible && playbackPoints.isNotEmpty)
+                                      Marker(
+                                        markerId: const MarkerId('route-playback'),
+                                        position: LatLng(
+                                          (playbackPoints[playbackIndex]['latitude']
+                                                  as num)
+                                              .toDouble(),
+                                          (playbackPoints[playbackIndex]['longitude']
+                                                  as num)
+                                              .toDouble(),
+                                        ),
+                                        icon: BitmapDescriptor.defaultMarkerWithHue(
+                                          BitmapDescriptor.hueAzure,
+                                        ),
+                                        infoWindow: const InfoWindow(
+                                          title: 'Route playback',
+                                        ),
+                                        zIndex: 2,
                                       ),
                                     for (final reason in waitingReasons)
                                       if ((reason['latitude'] as num?) != null &&
@@ -1399,7 +1555,7 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
                                             (reason['longitude'] as num).toDouble(),
                                           ),
                                           icon: BitmapDescriptor.defaultMarkerWithHue(
-                                            _selectedWaitingReasonId == reason['id']
+                                            highlightedWaitingReasonId == reason['id']
                                                 ? BitmapDescriptor.hueAzure
                                                 : BitmapDescriptor.hueOrange,
                                           ),
@@ -1429,6 +1585,12 @@ class _DesktopHybridDetailState extends State<_DesktopHybridDetail> {
               activities: activities,
               waitingReasons: waitingReasons,
               selectedWaitingReasonId: _selectedWaitingReasonId,
+              playbackWaitingReasonId: _playbackWaitingReasonId,
+              isPlaying: _isPlayingRoute,
+              hasFinishedPlayback: _routePlaybackFinished,
+              playbackProgress: _playbackProgressFor(playbackPoints),
+              onPlaybackPressed: () =>
+                  _toggleRoutePlayback(playbackPoints, waitingReasons),
               onWaitingReasonSelected: _selectWaitingReason,
             ),
           ],
@@ -1571,11 +1733,21 @@ class _RouteProgressBar extends StatelessWidget {
     required this.activities,
     required this.waitingReasons,
     required this.selectedWaitingReasonId,
+    required this.playbackWaitingReasonId,
+    required this.isPlaying,
+    required this.hasFinishedPlayback,
+    required this.playbackProgress,
+    required this.onPlaybackPressed,
     required this.onWaitingReasonSelected,
   });
   final List<Map> activities;
   final List<Map> waitingReasons;
   final int? selectedWaitingReasonId;
+  final int? playbackWaitingReasonId;
+  final bool isPlaying;
+  final bool hasFinishedPlayback;
+  final double playbackProgress;
+  final VoidCallback onPlaybackPressed;
   final ValueChanged<Map> onWaitingReasonSelected;
 
   @override
@@ -1607,6 +1779,13 @@ class _RouteProgressBar extends StatelessWidget {
     final totalMilliseconds = lowerBound == null || upperBound == null
         ? 0
         : upperBound.difference(lowerBound).inMilliseconds;
+    final canPlay = activities.where((item) =>
+        item['latitude'] is num &&
+        item['longitude'] is num &&
+        (item['latitude'] as num) != 0 &&
+        (item['longitude'] as num) != 0).length > 1;
+    final effectiveWaitingReasonId =
+        playbackWaitingReasonId ?? selectedWaitingReasonId;
 
     double eventPosition(Map reason) {
       final eventTime = timestamp(reason['submittedAt']);
@@ -1618,7 +1797,7 @@ class _RouteProgressBar extends StatelessWidget {
     }
 
     return Container(
-      height: 56,
+      height: 78,
       padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: BoxDecoration(
         border: Border.all(color: _desktopBorder),
@@ -1626,14 +1805,37 @@ class _RouteProgressBar extends StatelessWidget {
       ),
       child: Row(
         children: [
-          Container(
-            width: 42,
-            height: 42,
-            decoration: const BoxDecoration(
-              color: HrmsColors.blue,
-              shape: BoxShape.circle,
+          Tooltip(
+            message: !canPlay
+                ? 'At least two GPS points are needed to play the route.'
+                : isPlaying
+                ? 'Pause route playback'
+                : hasFinishedPlayback
+                ? 'Replay route'
+                : 'Play route',
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: canPlay ? onPlaybackPressed : null,
+                customBorder: const CircleBorder(),
+                child: Ink(
+                  width: 42,
+                  height: 42,
+                  decoration: BoxDecoration(
+                    color: canPlay ? HrmsColors.blue : _desktopBorder,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    isPlaying
+                        ? Icons.pause_rounded
+                        : hasFinishedPlayback
+                        ? Icons.replay_rounded
+                        : Icons.play_arrow_rounded,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
             ),
-            child: const Icon(Icons.play_arrow_rounded, color: Colors.white),
           ),
           const SizedBox(width: 14),
           Text(
@@ -1644,37 +1846,100 @@ class _RouteProgressBar extends StatelessWidget {
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) => Stack(
-                alignment: Alignment.center,
                 children: [
-                  Container(height: 3, color: const Color(0xFFBFD2FF)),
-                  Positioned(left: 0, child: _routeEndpoint(_desktopGreen)),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    top: 32,
+                    child: Container(
+                      height: 3,
+                      color: const Color(0xFFBFD2FF),
+                    ),
+                  ),
+                  if (playbackProgress > 0)
+                    Positioned(
+                      left: 0,
+                      top: 32,
+                      child: Container(
+                        width: (constraints.maxWidth *
+                                playbackProgress.clamp(0, 1))
+                            .toDouble(),
+                        height: 3,
+                        color: HrmsColors.blue,
+                      ),
+                    ),
+                  if (playbackProgress > 0)
+                    Positioned(
+                      left: (constraints.maxWidth * playbackProgress.clamp(0, 1) -
+                              6)
+                          .clamp(0, constraints.maxWidth - 12)
+                          .toDouble(),
+                      top: 27,
+                      child: Container(
+                        width: 12,
+                        height: 12,
+                        decoration: const BoxDecoration(
+                          color: HrmsColors.blue,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                    ),
+                  Positioned(
+                    left: 0,
+                    top: 28,
+                    child: _routeEndpoint(_desktopGreen),
+                  ),
                   if (activities.length > 1)
-                    Positioned(right: 0, child: _routeEndpoint(_desktopRed)),
+                    Positioned(
+                      right: 0,
+                      top: 28,
+                      child: _routeEndpoint(_desktopRed),
+                    ),
                   for (final reason in waitingReasons)
                     Positioned(
-                      left: eventPosition(reason) * constraints.maxWidth,
-                      child: Transform.translate(
-                        offset: const Offset(-9, 0),
-                        child: Tooltip(
-                          message: '${reason['reason'] ?? 'Waiting reason'}',
-                          child: InkWell(
-                            onTap: () => onWaitingReasonSelected(reason),
-                            customBorder: const CircleBorder(),
-                            child: Container(
-                              width: 18,
-                              height: 18,
-                              decoration: BoxDecoration(
-                                color: selectedWaitingReasonId == reason['id']
-                                    ? HrmsColors.blue
-                                    : _desktopOrange,
-                                border: Border.all(color: Colors.white, width: 2),
-                                shape: BoxShape.circle,
-                              ),
-                              child: const Icon(
-                                Icons.chat_bubble_outline_rounded,
-                                size: 9,
-                                color: Colors.white,
-                              ),
+                      left: (eventPosition(reason) * constraints.maxWidth - 24)
+                          .clamp(0, constraints.maxWidth - 48)
+                          .toDouble(),
+                      top: 4,
+                      child: Tooltip(
+                        message: '${reason['reason'] ?? 'Waiting reason'}',
+                        child: InkWell(
+                          onTap: () => onWaitingReasonSelected(reason),
+                          borderRadius: BorderRadius.circular(8),
+                          child: SizedBox(
+                            width: 48,
+                            height: 70,
+                            child: Column(
+                              children: [
+                                Container(
+                                  width: 14,
+                                  height: 14,
+                                  decoration: BoxDecoration(
+                                    color: effectiveWaitingReasonId == reason['id']
+                                        ? HrmsColors.blue
+                                        : _desktopOrange,
+                                    border: Border.all(color: Colors.white, width: 2),
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                                Container(
+                                  width: 2,
+                                  height: 30,
+                                  color: const Color(0xFFBFD2FF),
+                                ),
+                                Text(
+                                  timestamp(reason['submittedAt']) == null
+                                      ? '--:--'
+                                      : DateFormat('h:mm').format(
+                                          timestamp(reason['submittedAt'])!,
+                                        ),
+                                  style: const TextStyle(
+                                    color: _desktopMuted,
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ),

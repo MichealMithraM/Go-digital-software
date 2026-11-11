@@ -62,6 +62,7 @@ class _EmployeeSidebarState extends State<EmployeeSidebar> with TickerProviderSt
       case 'Task Review': return Icons.fact_check_rounded;
       case 'Task Status': return Icons.assessment_rounded;
       case 'Video Task Planner': return Icons.video_collection_rounded;
+            case 'Tech Workspace': return Icons.terminal_rounded;
       case 'Feedback': return Icons.feedback_outlined;
       case 'Settings': return Icons.settings_outlined;
       default: return Icons.circle_outlined;

@@ -333,6 +333,11 @@ class _AdminLayoutState extends State<AdminLayout>
         'title': 'Employee Workspace',
         'route': '/admin-workspace',
       },
+            {
+        'icon': Icons.terminal_rounded,
+        'title': 'Tech Projects',
+        'route': '/tech-projects',
+      },
       {
         'icon': Icons.timer_outlined,
         'title': 'Task Deadline Rules',

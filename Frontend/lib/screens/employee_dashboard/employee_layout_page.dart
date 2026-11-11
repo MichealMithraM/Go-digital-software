@@ -34,6 +34,8 @@ import 'package:godigital_portal/screens/employee_dashboard/feedback_history_pag
 
 import 'package:godigital_portal/screens/employee_dashboard/employee_settings_page.dart';
 import 'package:godigital_portal/screens/employee_dashboard/employee_workspace_page.dart';
+import 'package:godigital_portal/screens/employee_dashboard/tech_workspace.dart'
+    show TechWorkspacePage;
 
 class EmployeeLayoutPage extends StatefulWidget {
   const EmployeeLayoutPage({super.key});
@@ -68,6 +70,7 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
     'Daily Reports',
     'Additional Task',
     'Employee Workspace',
+    'Tech Workspace',
   ];
 
   /// Converts a saved access value (route path or title) to a sidebar title.
@@ -82,6 +85,12 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
         p.contains('content assigned') || p.contains('client-assigned') ||
         p.contains('client_assigned') || p.contains('client assigned')) {
       return null;
+    }
+    // Must come BEFORE the generic "workspace" check below, otherwise
+    // "Tech Workspace" would be read as "Employee Workspace".
+    if (p.contains('tech workspace') || p.contains('tech-workspace') ||
+        p.contains('tech_workspace') || p.contains('tech-projects')) {
+      return 'Tech Workspace';
     }
     if (p.contains('workspace')) return 'Employee Workspace';
     if (p.contains('video') && p.contains('planner')) {
@@ -129,11 +138,12 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
       menu.addAll(['Dashboard', 'Day Planner', 'Assigned Task', 'Chat']);
     }
     // Employee Workspace is always available to employees.
+    // Tech Workspace is only shown when Access Master grants it.
     if (!menu.contains('Employee Workspace')) menu.add('Employee Workspace');
 
     int rank(String m) {
       final i = _menuOrder.indexOf(m);
-      return i < 0 ? _menuOrder.length - 1 : i; // unknown → just before Workspace
+      return i < 0 ? _menuOrder.length - 2 : i; // unknown → just before the workspaces
     }
     final indexed = menu.asMap().entries.toList()
       ..sort((a, b) {
@@ -297,6 +307,8 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
           onNavigate: saveMenu,
           searchQuery: searchQuery,
         );
+      case 'Tech Workspace':
+        return const TechWorkspacePage();
       default:
         return getDashboardByRole(loggedInRole);
     }
@@ -309,7 +321,7 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
         if (!authService.isInitialized) {
           return const Scaffold(body: Center(child: CircularProgressIndicator()));
         }
-        
+
         if (!authService.isAuthenticated) {
           Future.microtask(() => Navigator.pushReplacementNamed(context, '/'));
           return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -317,7 +329,7 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
 
         final rawRole = authService.userRole;
         final loggedInRole = _getRoleFromString(rawRole);
-        
+
         // allowed_pages from DB → clean sidebar titles (old pages removed)
         final employeeMenuPages = _buildMenu(authService.user);
 
@@ -342,55 +354,55 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
                 child: ColoredBox(
                   color: const Color(0xFFF4F6FA),
                   child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Desktop fixed sidebar
-                  if (isDesktop) sidebarWidget,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // Desktop fixed sidebar
+                      if (isDesktop) sidebarWidget,
 
-                  // Main Content & Topbar Area
-                  Expanded(
-                    child: Stack(
-                      children: [
-                        Positioned.fill(
-                          top: 64,
-                          child: getSelectedPage(loggedInRole, employeeMenuPages),
+                      // Main Content & Topbar Area
+                      Expanded(
+                        child: Stack(
+                          children: [
+                            Positioned.fill(
+                              top: 64,
+                              child: getSelectedPage(loggedInRole, employeeMenuPages),
+                            ),
+                            Positioned(
+                              top: 0,
+                              left: 0,
+                              right: 0,
+                              height: 64,
+                              child: EmployeeTopbar(
+                                role: loggedInRole,
+                                onOpenNotifications: () {
+                                  setState(() {
+                                    selectedMenu = 'Notifications';
+                                  });
+                                },
+                                onOpenAssignedTasks: () {
+                                  setState(() {
+                                    selectedMenu = 'Assigned Task';
+                                  });
+                                },
+                                // Running chip → open that client card + tab in Employee Workspace
+                                onOpenRunningItem: (item) {
+                                  setState(() {
+                                    _workspaceFocus = item;
+                                    selectedMenu = 'Employee Workspace';
+                                  });
+                                },
+                                onSearch: (value) {
+                                  setState(() {
+                                    searchQuery = value;
+                                  });
+                                },
+                              ),
+                            ),
+                          ],
                         ),
-                        Positioned(
-                          top: 0,
-                          left: 0,
-                          right: 0,
-                          height: 64,
-                          child: EmployeeTopbar(
-                            role: loggedInRole,
-                            onOpenNotifications: () {
-                              setState(() {
-                                selectedMenu = 'Notifications';
-                              });
-                            },
-                            onOpenAssignedTasks: () {
-                              setState(() {
-                                selectedMenu = 'Assigned Task';
-                              });
-                            },
-                            // Running chip → open that client card + tab in Employee Workspace
-                            onOpenRunningItem: (item) {
-                              setState(() {
-                                _workspaceFocus = item;
-                                selectedMenu = 'Employee Workspace';
-                              });
-                            },
-                            onSearch: (value) {
-                              setState(() {
-                                searchQuery = value;
-                              });
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
                 ),
               ),
             );
@@ -399,5 +411,4 @@ class _EmployeeLayoutPageState extends State<EmployeeLayoutPage> {
       },
     );
   }
-
 }

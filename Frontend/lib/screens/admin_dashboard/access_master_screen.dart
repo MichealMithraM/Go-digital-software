@@ -93,6 +93,7 @@ class _AccessMasterScreenState extends State<AccessMasterScreen> {
         // Admin view of every client, every employee's tasks (live), Content
         // Calendar, Task Review, Live Tracking, Team Chat and the Pending list.
         {'key': '/admin-workspace', 'title': 'Employee Workspace'},
+                {'key': '/tech-projects', 'title': 'Tech Projects'},
         {'key': '/task-deadline-rules', 'title': 'Task Deadline Rules'},
       ];
     } else if (accessType == 'employee') {
@@ -109,6 +110,7 @@ class _AccessMasterScreenState extends State<AccessMasterScreen> {
         {'key': 'Task Review', 'title': 'Task Review'},
         {'key': 'Task Status', 'title': 'Task Status'},
         {'key': 'Notifications', 'title': 'Notifications'},
+                {'key': 'Tech Workspace', 'title': 'Tech Workspace'},
         {'key': 'Chat', 'title': 'Chat'},
         {'key': 'Feedback', 'title': 'Feedback'},
       ];

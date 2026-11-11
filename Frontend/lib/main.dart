@@ -51,6 +51,9 @@ import 'package:godigital_portal/screens/admin_dashboard/task_deadline_rules_scr
 import 'screens/admin_dashboard/privacy_policy_screen.dart';
 import 'package:godigital_portal/screens/employee_dashboard/employee_workspace_page.dart'
     show AdminWorkspaceScreen;
+// Tech Projects (admin) — the employee side opens TechWorkspacePage from the sidebar.
+import 'package:godigital_portal/screens/employee_dashboard/tech_workspace.dart'
+    show TechProjectsAdminScreen;
 
 /// Global navigator key — used by WaitingAlertService to show dialogs from
 /// outside the widget tree (e.g. background timers).
@@ -181,6 +184,11 @@ class MyApp extends StatelessWidget {
               const AdminGuard(child: AdminWorkspaceScreen()),
           '/task-deadline-rules': (context) =>
               const AdminGuard(child: TaskDeadlineRulesScreen()),
+
+          // Admin → Tech Projects (create projects, build the team, pick the
+          // in-charge, review the whole project).
+          '/tech-projects': (context) =>
+              const AdminGuard(child: TechProjectsAdminScreen()),
 
           '/attendance': (context) => const HrmsAttendanceEntry(),
           '/employee/dashboard': (context) => const EmployeeDashboardPage(),
